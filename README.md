@@ -3,6 +3,10 @@
 VoxCPM AudioVAE 纯 CPU 推理引擎（基于 GGML），仅保留 AudioVAE encoder/decoder，
 不含 VoxCPM 主模型（MiniCPM / LocEnc / LocDiT / tokenizer 等）。
 
+内置 ggml v0.22.0（`third_party/ggml` vendored 子树，已剪裁非 CPU backend 目录）。
+如需启用 `GGML_CUDA` 等其他 backend，需先从 ggml 上游补回对应的
+`src/ggml-<backend>/` 子目录。
+
 模型（`--model-path` 切换，均由 `../quantization/` 生成）：
 
 - `models/voxcpm-0.5b-audio-vae-fp16.gguf`：181 × F16（精度基线）

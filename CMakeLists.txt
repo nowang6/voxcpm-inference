@@ -28,6 +28,9 @@ set(GGML_DIR ${CMAKE_SOURCE_DIR}/third_party/ggml)
 set(GGML_CUDA OFF CACHE BOOL "ggml: use CUDA" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "ggml: use Vulkan" FORCE)
 set(GGML_NATIVE ON CACHE BOOL "ggml: optimize the build for the current system" FORCE)
+# vendored 子树已剪裁 examples/ tests/ 目录，显式关掉对应开关
+set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "ggml: build examples" FORCE)
+set(GGML_BUILD_TESTS    OFF CACHE BOOL "ggml: build tests"    FORCE)
 
 add_subdirectory(${GGML_DIR} ggml)
 
