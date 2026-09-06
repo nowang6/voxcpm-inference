@@ -1,0 +1,7 @@
+# Cursor/clangd 不读 .vscode/c_cpp_properties.json，需要这份配置才能找到头文件。
+CompileFlags:
+  CompilationDatabase: build
+  Add:
+    - -std=gnu++17
+    - -Iinclude
+    - -Ithird_party/ggml/include
