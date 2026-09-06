@@ -50,7 +50,39 @@ cmake --build build -j
 一键脚本：`./build_and_run.sh`（默认用 `models/voxcpm-0.5b-audio-vae-q4_0.gguf`，
 可传参切换：`./build_and_run.sh models/voxcpm-0.5b-audio-vae-fp16.gguf`）
 
-## 3. 接口概览
+## 3. 构建（Hexagon NPU 后端，可选）
+
+已合入 `../ggml-hexagon`（zhouwg fork）的高通 Hexagon/HTP 后端到 vendored ggml
+（backport 到 v0.22.0，`third_party/ggml/src/ggml-hexagon/`，含官方 dspqueue 变体
+与 FastRPC/mempool 变体，由 `GGML_HEXAGON_USE_MEMPOOL` 切换）。依赖 Hexagon SDK
+（本机 `/home/niwang/hexagon-sdk6.6`，6.6.0.0 + Tools 19.0.07）：
+
+```bash
+# 首次需生成 SDK 的 IDL 编译器（build_idl 硬编码该路径）
+make -C "$HOME/hexagon-sdk6.6/ipc/fastrpc/qaic" bin/qaic
+
+# 官方 dspqueue 变体
+cmake -B build-hexagon -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_HEXAGON=ON -DGGML_HEXAGON_USE_MEMPOOL=OFF \
+      -DHEXAGON_SDK_ROOT="$HOME/hexagon-sdk6.6"
+cmake --build build-hexagon -j
+
+# FastRPC/mempool 变体
+cmake -B build-hexagon-mempool -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_HEXAGON=ON -DGGML_HEXAGON_USE_MEMPOOL=ON \
+      -DHEXAGON_SDK_ROOT="$HOME/hexagon-sdk6.6"
+cmake --build build-hexagon-mempool -j
+```
+
+产物：AP 侧 `libggml-hexagon.so`（x86_64 宿主上仅编译冒烟；真机需 aarch64 交叉
+构建）+ DSP skeleton `libggml-htp-v73/v75/v79/v81.so`（hexagon-clang 交叉编译，
+QUALCOMM DSP6 ELF，部署到设备 cDSP）。无设备时运行会因 dlopen 失败而静默回退
+CPU，输出与纯 CPU 构建逐位一致。
+
+注意：应用层（`src/backend.cpp`）目前仍固定 CPU backend，NPU 混合执行
+（`ggml_backend_sched` CPU/HTP 分片）为后续任务。
+
+## 4. 接口概览
 
 核心路径：`AudioVAE::load_from_store()`（加载 GGUF）→
 `AudioVAE::decode()`（搭建解码计算图，latent `ne=[T, 64]`）→
