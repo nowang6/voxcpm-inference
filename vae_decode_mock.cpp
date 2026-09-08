@@ -19,7 +19,12 @@
  *       [--model-path models/voxcpm-0.5b-audio-vae-q4_0.gguf] \
  *       [--mock-dir mock] \
  *       [--output assets/out/output_streaming.wav] \
- *       [--threads 4]
+ *       [--threads 4] \
+ *       [--compare-wav assets/out/cpu_baseline.wav]
+ *
+ * 环境变量：
+ *   VOXCPM_PROFILE_OPS=1  逐算子计时画像（经单 backend 临时 sched 的 eval
+ *                         callback），全部步累计后输出 top-20 耗时算子
  */
 
 #include "voxcpm/audio-vae.h"
@@ -39,6 +44,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -59,7 +65,9 @@ struct Options {
   std::string model_path = "models/voxcpm-0.5b-audio-vae-q4_0.gguf";
   std::string mock_dir = "mock";
   std::string output_path = "assets/out/output_streaming.wav";
+  std::string compare_wav;
   int threads = 4;
+  int max_steps = 0;  // >0 时只重放前 N 步（调试/对拍用）
 };
 
 void print_usage(const char *argv0) {
@@ -69,7 +77,9 @@ void print_usage(const char *argv0) {
             << "  --model-path GGUF   (default: models/voxcpm-0.5b-audio-vae-q4_0.gguf)\n"
             << "  --mock-dir DIR      (default: mock)\n"
             << "  --output OUTPUT     (default: assets/out/output_streaming.wav)\n"
-            << "  --threads INT       (default: 4)\n";
+            << "  --threads INT       (default: 4)\n"
+            << "  --max-steps INT     只重放前 N 步（0=全部，调试用）\n"
+            << "  --compare-wav WAV   对拍指定 WAV（max|delta| + SNR），如 CPU 基线输出\n";
 }
 
 Options parse_args(int argc, char **argv) {
@@ -91,6 +101,10 @@ Options parse_args(int argc, char **argv) {
       options.output_path = require_value("--output");
     } else if (arg == "--threads") {
       options.threads = std::stoi(require_value("--threads"));
+    } else if (arg == "--max-steps") {
+      options.max_steps = std::stoi(require_value("--max-steps"));
+    } else if (arg == "--compare-wav") {
+      options.compare_wav = require_value("--compare-wav");
     } else if (arg == "--help" || arg == "-h") {
       print_usage(argv[0]);
       std::exit(0);
@@ -953,9 +967,182 @@ void write_wav_pcm16(const std::string &path, const std::vector<float> &audio,
 // 用 AudioVAE 解码器把 latent 特征还原成 PCM 波形。
 // latent_host 的布局：ggml 张量 ne=[total_patches, feat_dim] 的 contiguous
 // 数据，即 latent_host[c * total_patches + t]（时间维最快）。
+
+// =============================================================================
+// 逐算子计时画像（VOXCPM_PROFILE_OPS=1 时启用）
+//
+// 生产路径不变；画像走一条独立的单 CPU backend 临时 sched，经 eval callback
+// 在每个节点执行前打点。执行 kernel 与生产路径完全一致（同为 CPU backend），
+// 仅调度壳不同，数值零差异。
+// =============================================================================
+
+struct OpProfiler {
+  // key = op 名 + 输出形状 + src0 op 名；value = 累计微秒 / 次数
+  std::map<std::string, double> us_by_key;
+  std::map<std::string, int64_t> count_by_key;
+  const ggml_tensor *prev = nullptr;
+  std::chrono::steady_clock::time_point last{};
+  int64_t total_us = 0;
+  bool dump_nodes = false;   // VOXCPM_DUMP_OPS=1：每节点打印 name/ne/前 3 值
+  int dump_seq = 0;
+
+  static void dump_node(const ggml_tensor *t, int seq) {
+    std::ostringstream oss;
+    oss << "[node " << seq << "] " << ggml_op_desc(t) << " '" << (t->name[0] ? t->name : "-")
+        << "' ne=[";
+    for (int i = 0; i < 4; ++i) {
+      if (i > 0) oss << ",";
+      oss << t->ne[i];
+    }
+    oss << "]";
+    // 前 3 个元素的校验值（需 host 可读：CPU 路径下 t->data 直接可解引用）
+    if (t->type == GGML_TYPE_F32 && t->buffer != nullptr &&
+        ggml_backend_buffer_is_host(t->buffer) && t->data != nullptr) {
+      const float *v = static_cast<const float *>(t->data);
+      oss << " v[0..2] =";
+      for (int i = 0; i < 3 && i < ggml_nelements(t); ++i) {
+        oss << " " << v[i];
+      }
+      // 语义锚点：v[6]（L1 布局 = (t=1,c=0) / L2 布局 = (c=6,·)）、v[1536]
+      for (int idx : {6, 1536, 1537}) {
+        if (idx < ggml_nelements(t)) {
+          oss << " v[" << idx << "]=" << v[idx];
+        }
+      }
+      double sum = 0.0;
+      const int64_t n = ggml_nelements(t);
+      for (int64_t i = 0; i < n; ++i) {
+        sum += v[i];
+      }
+      oss << " sum=" << sum;
+    }
+    for (int s_i = 0; s_i < 2; ++s_i) {
+      const ggml_tensor *s = t->src[s_i];
+      if (s != nullptr && s->type == GGML_TYPE_F32 && s->data != nullptr &&
+          ggml_nelements(s) > 0) {
+        const float *sv = static_cast<const float *>(s->data);
+        oss << " src" << s_i << "[0..2] =";
+        for (int i = 0; i < 3 && i < ggml_nelements(s); ++i) {
+          oss << " " << sv[i];
+        }
+      }
+    }
+    std::cerr << oss.str() << "\n";
+  }
+
+  static std::string key_of(const ggml_tensor *t) {
+    std::ostringstream oss;
+    oss << ggml_op_desc(t) << " ne=[";
+    for (int i = 0; i < 4; ++i) {
+      if (i > 0) oss << ",";
+      oss << t->ne[i];
+    }
+    oss << "]";
+    if (t->src[0] != nullptr) {
+      oss << " src0=" << ggml_op_name(t->src[0]->op);
+    }
+    return oss.str();
+  }
+
+  static bool callback(ggml_tensor *t, bool ask, void *user_data) {
+    auto *self = static_cast<OpProfiler *>(user_data);
+    if (ask) {
+      return true;  // 观测全部节点
+    }
+    const auto now = std::chrono::steady_clock::now();
+    // sched 在节点计算完成后才回调 ask=false：(now - last) 覆盖的是 t 自身的
+    // 计算 + synchronize，因此归属给当前节点 t（此前记给 prev 导致整体错位一位）
+    if (self->prev != nullptr) {
+      const double us = std::chrono::duration<double, std::micro>(now - self->last).count();
+      const std::string key = key_of(t);
+      self->us_by_key[key] += us;
+      self->count_by_key[key] += 1;
+      self->total_us += static_cast<int64_t>(us);
+    }
+    self->prev = t;
+    self->last = now;
+    if (self->dump_nodes && self->dump_seq < 400) {
+      dump_node(t, self->dump_seq++);
+    }
+    return true;
+  }
+
+  void flush_tail() {
+    // 最后一个节点的执行时长在 compute 结束后补记
+    if (prev != nullptr) {
+      const double us =
+          std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - last)
+              .count();
+      const std::string key = key_of(prev);
+      us_by_key[key] += us;
+      count_by_key[key] += 1;
+      total_us += static_cast<int64_t>(us);
+      prev = nullptr;
+    }
+  }
+
+  void dump_top(int top_n, int n_calls) const {
+    std::vector<std::pair<std::string, double>> items(us_by_key.begin(), us_by_key.end());
+    std::sort(items.begin(), items.end(),
+              [](const auto &a, const auto &b) { return a.second > b.second; });
+    std::cerr << "\n[profile] top " << std::min<size_t>(top_n, items.size())
+              << " ops by total time (" << n_calls << " calls, total "
+              << std::fixed << std::setprecision(1)
+              << static_cast<double>(total_us) / 1000.0 << " ms)\n";
+    std::cerr << std::string(96, '-') << "\n";
+    double cumulative = 0.0;
+    for (size_t i = 0; i < items.size() && i < static_cast<size_t>(top_n); ++i) {
+      cumulative += items[i].second;
+      const int64_t n = count_by_key.at(items[i].first);
+      std::cerr << std::fixed << std::setprecision(1) << std::setw(10)
+                << items[i].second / 1000.0 << " ms | " << std::setw(7) << n
+                << "x | " << std::setprecision(2) << std::setw(5)
+                << (total_us > 0 ? 100.0 * items[i].second / static_cast<double>(total_us) : 0.0)
+                << "% | cum " << std::setprecision(1) << std::setw(5)
+                << (total_us > 0 ? 100.0 * cumulative / static_cast<double>(total_us) : 0.0)
+                << "% | " << items[i].first << "\n";
+    }
+  }
+};
+
+// 画像用的单 CPU backend sched：首次调用时创建并 reserve，之后各步
+// reset + alloc（CPU-only，无跨后端拷贝；仅供打点，生产路径不用它）。
+// 进程退出时随进程回收（工具进程，刻意不管理生命周期）。
+struct ProfileSched {
+  ggml_backend_sched_t sched = nullptr;
+  OpProfiler profiler;
+};
+
 std::vector<float> decode_waveform(AudioVAE &audio_vae, VoxCPMBackend &backend,
                                    const std::vector<float> &latent_host,
-                                   int total_patches, int feat_dim) {
+                                   int total_patches, int feat_dim,
+                                   ProfileSched *profile, AudioVAEL2Plan *l2plan) {
+  // 派生权重（convT 拆半 / F32 化 / inv）幂等构建：HTP 模式落在 HTP buffer
+  if (!audio_vae.ensure_derived_weights(backend)) {
+    fail("Failed to build derived decoder weights");
+  }
+
+  // Stage 2d：HTP 模式走拆段计划（9 张单后端图 + 段间显式搬运，图复用）
+  if (l2plan != nullptr) {
+    if (!l2plan->build(audio_vae, backend, total_patches)) {
+      fail("Failed to build L2 decode plan");
+    }
+    ggml_tensor *lin = l2plan->latent_input();
+    if (!lin) {
+      fail("L2 plan has no latent input");
+    }
+    backend.tensor_set(lin, latent_host.data(), 0,
+                       latent_host.size() * sizeof(float));
+    ggml_status st = l2plan->run(backend);
+    if (st != GGML_STATUS_SUCCESS) {
+      fail("L2 plan decode failed");
+    }
+    ggml_tensor *audio = l2plan->audio_output();
+    std::vector<float> waveform(static_cast<size_t>(ggml_nelements(audio)));
+    backend.tensor_get(audio, waveform.data(), 0, waveform.size() * sizeof(float));
+    return waveform;
+  }
+
   // 新建临时计算图：输入 latent [total_patches, feat_dim]，输出波形
   VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
   ggml_tensor *latent =
@@ -969,13 +1156,42 @@ std::vector<float> decode_waveform(AudioVAE &audio_vae, VoxCPMBackend &backend,
   // 搭建并执行解码计算图：reserve(预估内存) -> alloc(分配) -> 填输入 -> compute
   ggml_cgraph *graph = graph_ctx.new_graph();
   graph_ctx.build_forward(graph, audio);
-  backend.reserve_compute_memory(graph, "vae_mock.audio_vae.decode");
-  backend.alloc_graph(graph, "vae_mock.audio_vae.decode");
+  if (profile != nullptr) {
+    // 画像路径：单 CPU backend 的临时 sched + eval callback 打点
+    if (profile->sched == nullptr) {
+      ggml_backend_t backends[1] = {backend.raw_backend()};
+      // graph_size 容量只需 >= n_nodes + n_leafs；这里给充足余量
+      profile->sched = ggml_backend_sched_new(
+          backends, nullptr, 1, 8192,
+          /*parallel=*/false, /*op_offload=*/false);
+      if (profile->sched == nullptr) {
+        fail("Failed to create profiling sched");
+      }
+      ggml_backend_sched_set_eval_callback(profile->sched, OpProfiler::callback,
+                                           &profile->profiler);
+      if (!ggml_backend_sched_reserve(profile->sched, graph)) {
+        fail("Failed to reserve profiling sched buffers");
+      }
+    }
+    ggml_backend_sched_reset(profile->sched);
+    if (!ggml_backend_sched_alloc_graph(profile->sched, graph)) {
+      fail("Failed to alloc profiling sched graph");
+    }
+  } else {
+    backend.reserve_compute_memory(graph, "vae_mock.audio_vae.decode");
+    backend.alloc_graph(graph, "vae_mock.audio_vae.decode");
+  }
   backend.tensor_set(latent, latent_host.data(), 0,
                      latent_host.size() * sizeof(float));
   // 准备解码器所需的其他输入（如 sample-rate conditioning），再执行整个图
   audio_vae.prepare_decode_inputs(backend);
-  if (backend.compute(graph) != GGML_STATUS_SUCCESS) {
+  ggml_status status =
+      profile != nullptr ? ggml_backend_sched_graph_compute(profile->sched, graph)
+                         : backend.compute(graph);
+  if (profile != nullptr) {
+    profile->profiler.flush_tail();
+  }
+  if (status != GGML_STATUS_SUCCESS) {
     fail("AudioVAE decode failed");
   }
 
@@ -996,7 +1212,14 @@ int main(int argc, char **argv) {
     const Options options = parse_args(argc, argv);
 
     // ============ 1. 初始化后端并加载独立 VAE GGUF ============
-    VoxCPMBackend backend(BackendType::CPU, options.threads);
+    // VOXCPM_BACKEND=htp 启用 CPU+HTP 异构；未设置/=cpu 走纯 CPU（默认回退）
+    BackendType backend_type = BackendType::CPU;
+    if (const char* be = std::getenv("VOXCPM_BACKEND")) {
+        if (std::strcmp(be, "htp") == 0) {
+            backend_type = BackendType::HTP;
+        }
+    }
+    VoxCPMBackend backend(backend_type, options.threads);
     std::cerr << "Using backend: " << backend.backend_name();
     if (std::strlen(backend.backend_description()) > 0) {
       std::cerr << " (" << backend.backend_description() << ")";
@@ -1005,12 +1228,38 @@ int main(int argc, char **argv) {
     std::cerr << "Loading GGUF from " << options.model_path << " with "
               << options.threads << " threads...\n";
     auto store = std::make_shared<VoxCPMWeightStore>();
-    if (!store->load_from_file(options.model_path, backend)) {
+    // 权重分桶（Stage 2b 保守版）。GGUF 实测：dw 与 final conv 是 F16 [7,1,C]，
+    // pw 是 Q4_0 [Cin,Cout]，convT 是 Q4_0 [K*Cout,Cin]（k 主序折叠，2d 已展开）。
+    // 仅 pw 的 Q4_0 上 HTP——其唯一消费者是 MUL_MAT，可整体留在 HTP 侧。
+    // convT 当前仍被 CPU 的 unfold/conv_transpose_1d 消费，CPU 算子直接解引用
+    // HTP buffer 会读到垃圾（Stage 1 教训），2c lowering 后再迁移。
+    // VOXCPM_HTP_WEIGHTS=1：pw Q4_0 权重上 HTP。默认关——当前 im2col 混合图上
+    // HTP 子图数据流仍有问题（SNR<0），2c 图重写（HTP 内聚形态）后再默认开。
+    // 注意：WeightGroupFn 是函数指针，谓词必须无捕获 lambda。
+    const auto htp_group = [](const ggml_tensor *t) -> bool {
+      if (const char *e = std::getenv("VOXCPM_HTP_WEIGHTS"); e == nullptr || e[0] != '1') {
+        return false;
+      }
+      if (t->type != GGML_TYPE_Q4_0) {
+        return false;
+      }
+      if (std::strncmp(t->name, "audio_vae.decoder.", 18) != 0) {
+        return false;
+      }
+      // convT 名形如 model.N.block.1.weight（Q4_0 且以此结尾的只有 convT；
+      // res unit 的 block.N.block.1.weight 是 F16 dw，已被类型排除）
+      const char *suf = std::strstr(t->name, ".block.1.weight");
+      const bool is_convt = suf != nullptr && std::strcmp(suf, ".block.1.weight") == 0;
+      return !is_convt;
+    };
+    if (!store->load_from_file(options.model_path, backend, htp_group)) {
       fail("Failed to load GGUF: " + options.model_path);
     }
     std::cerr << "Weights buffer: " << std::fixed << std::setprecision(1)
               << static_cast<double>(store->buffer_size()) / (1024.0 * 1024.0)
-              << " MiB (weights kept in native GGUF dtypes)\n";
+              << " MiB CPU + " << std::setprecision(1)
+              << static_cast<double>(store->htp_buffer_size()) / (1024.0 * 1024.0)
+              << " MiB HTP (weights kept in native GGUF dtypes)\n";
 
     AudioVAE audio_vae;
     if (!audio_vae.load_from_store(store)) {
@@ -1040,12 +1289,37 @@ int main(int argc, char **argv) {
     }
 
     // ============ 3. 逐捕获重放 VAE decode，每步取尾 patch_len 拼接 ============
+    ProfileSched profile_sched;
+    ProfileSched *profile = nullptr;
+    if (const char *env = std::getenv("VOXCPM_PROFILE_OPS");
+        env != nullptr && env[0] == '1') {
+      profile = &profile_sched;
+      std::cerr << "Op profiling enabled (VOXCPM_PROFILE_OPS=1)\n";
+      if (const char *e = std::getenv("VOXCPM_DUMP_OPS"); e != nullptr && e[0] == '1') {
+        profile_sched.profiler.dump_nodes = true;
+        std::cerr << "Node dump enabled (VOXCPM_DUMP_OPS=1)\n";
+      }
+    }
+
     std::vector<float> full_waveform;
     full_waveform.reserve(static_cast<size_t>(manifest.calls.size()) *
                           static_cast<size_t>(manifest.patch_len_samples));
 
+    // Stage 2d：HTP 模式启用拆段解码计划（profile 路径仍走单图打点）
+    AudioVAEL2Plan *l2plan_ptr =
+        backend.is_htp_active() && profile == nullptr ? new AudioVAEL2Plan : nullptr;
+    if (l2plan_ptr != nullptr) {
+      std::cerr << "L2 decode plan enabled (HTP segmented graphs)\n";
+    }
+
     const auto decode_start = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < manifest.calls.size(); ++i) {
+    size_t n_calls = manifest.calls.size();
+    if (options.max_steps > 0) {
+      n_calls = std::min(n_calls, static_cast<size_t>(options.max_steps));
+      std::cerr << "Max steps: " << n_calls << " (of " << manifest.calls.size()
+                << ")\n";
+    }
+    for (size_t i = 0; i < n_calls; ++i) {
       const MockCall &call = manifest.calls[i];
       const std::string npz_path =
           (std::filesystem::path(options.mock_dir) / call.file).string();
@@ -1061,7 +1335,8 @@ int main(int argc, char **argv) {
       const std::vector<float> latent = npy_channels_to_latent(z, latent_dim);
       const int total_patches = static_cast<int>(z.shape[2]);
       std::vector<float> chunk = decode_waveform(audio_vae, backend, latent,
-                                                 total_patches, latent_dim);
+                                                 total_patches, latent_dim,
+                                                 profile, l2plan_ptr);
 
       // 每步取输出尾部一个 patch（流式语义：decoder 是因果卷积，尾部
       // patch_len_samples 个采样才是本步新增的音频）
@@ -1071,13 +1346,13 @@ int main(int argc, char **argv) {
           full_waveform.end(),
           chunk.end() - static_cast<std::ptrdiff_t>(tail), chunk.end());
 
-      if ((i + 1) % 16 == 0 || i + 1 == manifest.calls.size()) {
+      if ((i + 1) % 16 == 0 || i + 1 == n_calls) {
         const double elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           decode_start)
                 .count();
         std::cerr << "\r[mock] decoded " << (i + 1) << "/"
-                  << manifest.calls.size() << " | elapsed " << std::fixed
+                  << n_calls << " | elapsed " << std::fixed
                   << std::setprecision(1) << elapsed << "s" << std::flush;
       }
     }
@@ -1094,8 +1369,13 @@ int main(int argc, char **argv) {
               << "s) in " << decode_time << "s ("
               << std::setprecision(3)
               << decode_time / static_cast<double>(
-                                   std::max<size_t>(1, manifest.calls.size()))
-              << "s/call)\n";
+                                   std::max<size_t>(1, n_calls))
+              << "s/call, RTF " << std::setprecision(2)
+              << decode_time / std::max(audio_seconds, 1e-9) << ")\n";
+
+    if (profile != nullptr) {
+      profile->profiler.dump_top(20, static_cast<int>(n_calls));
+    }
 
     // ============ 4. 写出 WAV ============
     write_wav_pcm16(options.output_path, full_waveform, output_sample_rate);
@@ -1125,6 +1405,36 @@ int main(int argc, char **argv) {
     } else {
       std::cerr << "No reference_streaming.wav found, skip comparison.\n";
     }
+
+    // ============ 6. 与 --compare-wav 指定的 WAV 对拍（max|Δ| + SNR）============
+    if (!options.compare_wav.empty()) {
+      if (!std::filesystem::is_regular_file(options.compare_wav)) {
+        fail("Compare WAV does not exist: " + options.compare_wav);
+      }
+      const WavData base = read_wav_file(options.compare_wav);
+      const std::vector<float> base_mono = convert_to_mono(base);
+      const size_t n = std::min(base_mono.size(), full_waveform.size());
+      double max_abs = 0.0;
+      double sig_energy = 0.0;
+      double err_energy = 0.0;
+      for (size_t k = 0; k < n; ++k) {
+        const double d = static_cast<double>(base_mono[k]) -
+                         static_cast<double>(full_waveform[k]);
+        max_abs = std::max(max_abs, std::fabs(d));
+        sig_energy += static_cast<double>(base_mono[k]) *
+                      static_cast<double>(base_mono[k]);
+        err_energy += d * d;
+      }
+      const double snr_db =
+          err_energy > 0.0 ? 10.0 * std::log10(sig_energy / err_energy)
+                           : std::numeric_limits<double>::infinity();
+      std::cerr << "Compare with " << options.compare_wav << ": length "
+                << base_mono.size() << " vs " << full_waveform.size()
+                << ", max|delta| = " << std::scientific << max_abs
+                << ", SNR = " << std::fixed << std::setprecision(1) << snr_db
+                << " dB\n";
+    }
+    delete l2plan_ptr;
     return 0;
   } catch (const std::exception &e) {
     std::cerr << "Error: " << e.what() << "\n";

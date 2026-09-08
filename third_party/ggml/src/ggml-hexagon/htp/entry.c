@@ -163,6 +163,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_UNARY_EXP:       return "UNARY_EXP";
         case HTP_OP_UNARY_TANH:      return "UNARY_TANH";
         case HTP_OP_UNARY_ABS:       return "UNARY_ABS";
+        case HTP_OP_UNARY_SIN:       return "UNARY_SIN";
         case HTP_OP_UNARY_LOG:       return "UNARY_LOG";
         case HTP_OP_UNARY_SILU:      return "UNARY_SILU";
         case HTP_OP_UNARY_GELU:      return "UNARY_GELU";
@@ -780,6 +781,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_UNARY_TANH]      = op_unary,
     [HTP_OP_UNARY_ABS]       = op_unary,
     [HTP_OP_UNARY_LOG]       = op_unary,
+    [HTP_OP_UNARY_SIN]       = op_unary,
     [HTP_OP_L2_NORM]         = op_unary,
     [HTP_OP_UNARY_SILU]      = op_unary,
     [HTP_OP_UNARY_GELU]      = op_unary,
@@ -924,6 +926,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_DIAG:    *htp_op = HTP_OP_DIAG;        return 0;
         case GGML_OP_TRI:     *htp_op = HTP_OP_TRI;         return 0;
         case GGML_OP_SOLVE_TRI: *htp_op = HTP_OP_SOLVE_TRI; return 0;
+        case GGML_OP_SIN:     *htp_op = HTP_OP_UNARY_SIN;   return 0;
         case GGML_OP_UNARY: {
             if (!op_params) {
                 FARF(ERROR, "ggml_op_to_htp_op: UNARY missing op_params");

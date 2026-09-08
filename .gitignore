@@ -46,3 +46,5 @@ models
 model_conversion_and_inference_zh.md
 
 *.gguf
+# numeric gate reference for HTP path
+!assets/out/cpu_baseline.wav

@@ -31,7 +31,7 @@ cmake --build build -j
 
 ## 2. 重放 mock 捕获（latent → WAV）
 
-输入为流式 mock 捕获（`../quantization/mock/`，参考姊妹仓 `voxcpm-vae` 的
+输入为流式 mock 捕获（`assets/mock`，参考姊妹仓 `voxcpm-vae` 的
 `tools/decode_mock.py`）：每步捕获 decoder 输入 `z=[1, 64, 6]`，独立解码后
 取尾部 `patch_len_samples` 个采样拼接成完整语音，并与
 `mock/reference_streaming.wav` 对拍 `max|Δ|`。
@@ -39,13 +39,13 @@ cmake --build build -j
 ```bash
 ./build/examples/voxcpm-vae-decode-mock \
   --model-path ./models/voxcpm-0.5b-audio-vae-q4_0.gguf \
-  --mock-dir ../quantization/mock \
+  --mock-dir assets/mock \
   --output ./assets/out/output_streaming.wav \
   --threads 4
 ```
 
 `--model-path` 换成 `q4_0.gguf` / `fp16.gguf` 即可对拍其他精度（捕获目录在
-姊妹目录 `../quantization/mock`）。
+姊妹目录 `assets/mock`）。
 
 一键脚本：`./build_and_run.sh`（默认用 `models/voxcpm-0.5b-audio-vae-q4_0.gguf`，
 可传参切换：`./build_and_run.sh models/voxcpm-0.5b-audio-vae-fp16.gguf`）
@@ -81,6 +81,19 @@ CPU，输出与纯 CPU 构建逐位一致。
 
 注意：应用层（`src/backend.cpp`）目前仍固定 CPU backend，NPU 混合执行
 （`ggml_backend_sched` CPU/HTP 分片）为后续任务。
+
+真机上启用 HTP 异构模式需在运行 mock 工具时显式设置环境变量：
+
+```bash
+VOXCPM_BACKEND=htp ./build-htp/examples/voxcpm-vae-decode-mock \
+  --model-path ./models/voxcpm-0.5b-audio-vae-q4_0.gguf \
+  --mock-dir assets/mock \
+  --output ./assets/out/output_streaming.wav \
+  --threads 4
+```
+
+未设置（或设置为其他值）时默认走纯 CPU backend。可通过运行日志中的
+`Using backend:` 一行确认实际使用的后端（`HTP` 表示异构已生效）。
 
 ## 4. 接口概览
 

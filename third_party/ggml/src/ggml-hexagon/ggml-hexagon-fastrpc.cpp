@@ -2934,6 +2934,9 @@ static bool ggml_op_to_htp_op_unary(int32_t ggml_op, const int32_t * op_params, 
         case GGML_OP_SQRT:    *htp_op = HTP_OP_SQRT;        return true;
         case GGML_OP_LOG:     *htp_op = HTP_OP_UNARY_LOG;   return true;
         case GGML_OP_TRI:     *htp_op = HTP_OP_TRI;         return true;
+        case GGML_OP_SIN:
+            *htp_op = HTP_OP_UNARY_SIN;
+            return true;
         case GGML_OP_UNARY:
             if (!op_params) return false;
             switch (op_params[0]) {
@@ -4124,6 +4127,22 @@ static bool hexagon_validate_unary(ggml_backend_hexagon_context * ctx, const ggm
     }
 }
 
+// GGML_OP_SIN (standalone op in ggml v0.22, not a GGML_OP_UNARY subtype) via
+// the QHL qhmath_hvx_sin_af kernel: F32 in/out, same shape, contiguous dst.
+static bool hexagon_validate_sin(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+    GGML_UNUSED(ctx);
+    const ggml_tensor * src0 = op->src[0];
+    if (src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
+        return false;
+    if (ggml_is_permuted(src0))
+        return false;
+    if (!ggml_are_same_shape(src0, op))
+        return false;
+    if (!ggml_is_contiguous(op))
+        return false;
+    return true;
+}
+
 static bool hexagon_validate_glu(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
@@ -4447,6 +4466,7 @@ static void init_op_validators(void) {
     s_op_validators[GGML_OP_ROPE]           = hexagon_validate_rope;
     s_op_validators[GGML_OP_SOFT_MAX]       = hexagon_validate_soft_max;
     s_op_validators[GGML_OP_UNARY]          = hexagon_validate_unary;
+    s_op_validators[GGML_OP_SIN]            = hexagon_validate_sin;
     s_op_validators[GGML_OP_GLU]            = hexagon_validate_glu;
     s_op_validators[GGML_OP_SCALE]          = hexagon_validate_scale;
     s_op_validators[GGML_OP_CPY]            = hexagon_validate_cpy;
