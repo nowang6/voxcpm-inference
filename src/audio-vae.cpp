@@ -1340,9 +1340,9 @@ void final_conv_k7_l2_custom(ggml_tensor* dst,
     const int64_t t0 = ith * per;
     const int64_t t1 = std::min(t0 + per, t_len);
 
-    const int64_t n_vec = channels / 4;
     for (int64_t t = t0; t < t1; ++t) {
 #if defined(__ARM_NEON)
+        const int64_t n_vec = channels / 4;
         float32x4_t acc[96 / 4];
         for (int64_t v = 0; v < n_vec; ++v) {
             acc[v] = vdupq_n_f32(0.0f);
