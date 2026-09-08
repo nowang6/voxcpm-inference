@@ -27,21 +27,21 @@ echo "== bench_sm6650: mode=$MODE runs=$RUNS threads=$THREADS =="
 $ADB root >/dev/null 2>&1 || true
 $ADB shell 'for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > $c; done 2>/dev/null' || true
 
-# ---- 2) 大核簇识别（cpuinfo_max_freq == 全局最大者）----
+# ---- 2) 大核簇识别（cpuinfo_max_freq ≥ 90% 全局最大者；SM6650: 4×A55@1.8G + 3×A78@2.2G + 1×A78@2.3G → cpu4-7）----
 if [ "${TASKSET_MASK:-auto}" = "auto" ]; then
-    TASKSET_MASK=$($ADB shell 'FMAX=$(cat /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq 2>/dev/null | sort -rn | head -1); m=0; for c in /sys/devices/system/cpu/cpu[0-9]*; do n=${c##*cpu}; f=$(cat $c/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0); if [ "$f" = "$FMAX" ]; then m=$((m | (1<<n))); fi; done; printf %x $m' | tr -d '\r\n')
+    TASKSET_MASK=$($ADB shell 'FMAX=$(cat /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq 2>/dev/null | sort -rn | head -1); TH=$((FMAX * 9 / 10)); m=0; for c in /sys/devices/system/cpu/cpu[0-9]*; do n=${c##*cpu}; f=$(cat $c/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0); if [ "$f" -ge "$TH" ]; then m=$((m | (1<<n))); fi; done; printf %x $m' | tr -d '\r\n')
 fi
 TS_PREFIX=""
 if [ -n "${TASKSET_MASK:-}" ] && [ "$TASKSET_MASK" != "none" ]; then
-    TS_PREFIX="taskset 0x$TASKSET_MASK"
-    echo "== big-core mask: 0x$TASKSET_MASK =="
+    TS_PREFIX="taskset $TASKSET_MASK"
+    echo "== big-core mask: $TASKSET_MASK =="
 else
     echo "== no taskset pinning =="
 fi
 
 # ---- 3) 温度采样（top3 zone，毫摄氏度）----
 temp_now() {
-    $ADB shell 'for t in /sys/class/thermal/thermal_zone*/temp; do cat $t 2>/dev/null; done | sort -rn | head -3 | tr "\n" " "' | tr -d '\r'
+    $ADB shell 'for t in /sys/class/thermal/thermal_zone*/temp; do cat $t 2>/dev/null; done | sort -rn | head -3 | tr "\n" " "' | tr -d '\r' || true
 }
 
 run_once() {
@@ -64,7 +64,7 @@ RESULTS_FILE=$(mktemp /tmp/bench_sm6650.XXXXXX)
 for r in $(seq 1 "$RUNS"); do
     sleep "$COOLDOWN"
     T0=$(temp_now)
-    OUT=$(run_once)
+    OUT=$(run_once) || OUT=""
     T1=$(temp_now)
     LINE=$(printf '%s\n' "$OUT" | grep -oE 'in [0-9.]+s \([0-9.]+s/call, RTF [0-9.]+' | grep -oE '[0-9.]+$' | head -1)
     SNR=$(printf '%s\n' "$OUT" | grep 'Compare with cpu_baseline' | grep -oE 'SNR = [0-9.]+' | grep -oE '[0-9.]+$')
