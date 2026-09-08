@@ -926,6 +926,35 @@ bool AudioVAE::ensure_derived_weights(VoxCPMBackend& backend) {
         }
     };
 
+    // ---- dw k7 权重 F32 化（B2：Neon 连续通道卷积，消除每 tap F16→F32）----
+    // src [K,1,C] F16 扁平序 v[c*K + k]（ne[0]=k 最快）→ 转置灌入 F32 2D
+    // [C, K]，使 kernel 的 w[k*C + c]（k 行、c 连续）索引与声明形状一致。
+    auto derive_dw_weight = [&](const ggml_tensor* src) {
+        if (src == nullptr) {
+            return;
+        }
+        const int64_t K = src->ne[0];
+        const int64_t C = src->ne[2];
+        std::vector<float> v;
+        to_f32_host(src, v);
+        PendingSet& p = pending.emplace_back();
+        p.tensor = new_derived_2d(std::string(src->name) + "/dwf32", GGML_TYPE_F32,
+                                  C, K, false);
+        p.bytes.resize(v.size() * sizeof(float));
+        auto* wt = reinterpret_cast<float*>(p.bytes.data());
+        for (int64_t c = 0; c < C; ++c) {
+            for (int64_t k = 0; k < K; ++k) {
+                wt[k * C + c] = v[static_cast<size_t>(c) * K + k];
+            }
+        }
+    };
+    derive_dw_weight(weights_.decoder_model_0_weight);
+    for (const DecoderBlockWeights& block : weights_.decoder_blocks) {
+        for (const ResidualUnitWeights* res : {&block.res0, &block.res1, &block.res2}) {
+            derive_dw_weight(res->conv1_weight);
+        }
+    }
+
     derive_vector("decoder.model.0.bias/f32", weights_.decoder_model_0_bias, 0.0f, false);
     derive_vector("decoder.model.1.bias/f32", weights_.decoder_model_1_bias, 0.0f, false);
     for (const DecoderBlockWeights& block : weights_.decoder_blocks) {
@@ -1040,6 +1069,8 @@ namespace {
 
 // L2 深度卷积自定义核：x [C, T, 1] / w [K, 1, C] / b [C]
 // 语义与 L1 版 depthwise_conv_custom 一致：y[c,t] = b[c] + Σ_k x[c, t*s + k*d - 2p] * w[k,c]
+// B2：F32 权重（"/dwf32" 派生）走 Neon 路径——t 外层、沿连续通道 vdupq/vld1q/vfmaq，
+// 每 tap 消除 F16→F32 标量转换；F16 权重保留原标量路径（回退兼容）。
 void depthwise_conv_l2_custom(ggml_tensor* dst,
                               const ggml_tensor* x,
                               const ggml_tensor* weight,
@@ -1051,10 +1082,17 @@ void depthwise_conv_l2_custom(ggml_tensor* dst,
     const int64_t t_len = x->ne[1];      // L2：时间在 ne[1]
     const int64_t channels = x->ne[0];   // 通道在 ne[0]
     const int64_t batch = x->ne[2];
-    const int64_t kernel = weight->ne[0];
-
-    VOXCPM_ASSERT(weight->ne[1] == 1);
-    VOXCPM_ASSERT(weight->ne[2] == channels);
+    // 两种权重布局：F16 原始 [K,1,C]（k 步进 nb[0]、c 步进 nb[2]）；
+    // F32 派生 "/dwf32" 2D [C, K]（k 行、c 连续，nb[1] = C*4）
+    const bool w_is_f32_2d = weight->type == GGML_TYPE_F32;
+    const int64_t kernel = w_is_f32_2d ? weight->ne[1] : weight->ne[0];
+    if (w_is_f32_2d) {
+        VOXCPM_ASSERT(weight->ne[0] == channels);
+        VOXCPM_ASSERT(weight->nb[0] == sizeof(float));
+    } else {
+        VOXCPM_ASSERT(weight->ne[1] == 1);
+        VOXCPM_ASSERT(weight->ne[2] == channels);
+    }
     VOXCPM_ASSERT(dst->ne[0] == channels);
     VOXCPM_ASSERT(dst->ne[1] == t_len);
     VOXCPM_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
@@ -1064,10 +1102,83 @@ void depthwise_conv_l2_custom(ggml_tensor* dst,
     const uint8_t* b_data = bias ? static_cast<const uint8_t*>(bias->data) : nullptr;
     uint8_t* dst_data = static_cast<uint8_t*>(dst->data);
 
+#if defined(__ARM_NEON)
+    // Neon 路径：w 为 F32 "/dwf32"（k 行 c 连续，nb[1] = C*4），b 为 F32 或空。
+    // 通道全部连续（x/dst 行内 nb[0]==4）时按 t 行并行，acc 沿通道驻留寄存器组。
+    if (w_is_f32_2d && (bias == nullptr || bias->type == GGML_TYPE_F32) &&
+        x->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
+        weight->nb[0] == sizeof(float)) {
+        const int64_t n_vec = channels / 4;   // 模型 C 均 4 的倍数（64~1536）
+        const int64_t work_items = t_len * batch;
+        const int64_t per = (work_items + nth - 1) / nth;
+        const int64_t r0 = ith * per;
+        const int64_t r1 = std::min(r0 + per, work_items);
+        // acc 缓冲：C=1536 → 384 个 float32x4 = 6 KiB 栈
+        float32x4_t acc[384];
+        VOXCPM_ASSERT(n_vec <= 384);
+
+        for (int64_t row = r0; row < r1; ++row) {
+            const int64_t b = row / t_len;
+            const int64_t t = row % t_len;
+            const float* xr0 = reinterpret_cast<const float*>(x_data + b * x->nb[2]);
+            float* yr = reinterpret_cast<float*>(dst_data + b * dst->nb[2] + t * dst->nb[1]);
+            const float* wv = reinterpret_cast<const float*>(w_data);
+            const float* bv = b_data ? reinterpret_cast<const float*>(b_data) : nullptr;
+
+            // 因果/右界内的 tap 范围（src_t = t*s + k*d − 2p 对 k 单调）
+            int64_t k_lo = 0;
+            if (op->dilation > 0) {
+                const int64_t min_k = (-t * op->stride + op->padding * 2 + op->dilation - 1) / op->dilation;
+                k_lo = std::max<int64_t>(0, min_k);
+            }
+            int64_t k_hi = kernel;
+            if (op->dilation > 0) {
+                const int64_t max_k = (t_len - 1 - t * op->stride + op->padding * 2) / op->dilation + 1;
+                k_hi = std::min<int64_t>(kernel, max_k);
+            }
+
+            for (int64_t v = 0; v < n_vec; ++v) {
+                acc[v] = bv ? vld1q_f32(bv + v * 4) : vdupq_n_f32(0.0f);
+            }
+            for (int64_t k = k_lo; k < k_hi; ++k) {
+                const int64_t src_t = t * op->stride + k * op->dilation - op->padding * 2;
+                const float* xk = xr0 + src_t * (x->nb[1] / sizeof(float));
+                const float* wk = wv + k * channels;
+                for (int64_t v = 0; v < n_vec; ++v) {
+                    acc[v] = vfmaq_f32(acc[v], vld1q_f32(xk + v * 4), vld1q_f32(wk + v * 4));
+                }
+            }
+            for (int64_t v = 0; v < n_vec; ++v) {
+                vst1q_f32(yr + v * 4, acc[v]);
+            }
+            // 标量尾（C % 4 ≠ 0 时；当前模型不触发）
+            for (int64_t c = n_vec * 4; c < channels; ++c) {
+                float s = bv ? bv[c] : 0.0f;
+                for (int64_t k = k_lo; k < k_hi; ++k) {
+                    const int64_t src_t = t * op->stride + k * op->dilation - op->padding * 2;
+                    s += xr0[src_t * (x->nb[1] / sizeof(float)) + c] * wv[k * channels + c];
+                }
+                yr[c] = s;
+            }
+        }
+        return;
+    }
+#endif  // __ARM_NEON
+
     const int64_t work_items = channels * batch;
     const int64_t items_per_thread = (work_items + nth - 1) / nth;
     const int64_t item_begin = ith * items_per_thread;
     const int64_t item_end = std::min<int64_t>(item_begin + items_per_thread, work_items);
+
+    // 标量回退（host / 非 Neon，或 F16 权重兼容路径）
+    auto w_at = [&](int64_t c, int64_t k) -> float {
+        if (w_is_f32_2d) {
+            // F32 派生 2D [C, K]：k 行、c 连续
+            return reinterpret_cast<const float*>(w_data)[k * channels + c];
+        }
+        // 原始 F16 [K,1,C]：c 步进 nb[2]、k 步进 nb[0]
+        return load_f32_scalar(w_data + c * weight->nb[2] + k * weight->nb[0], weight->type);
+    };
 
     for (int64_t item = item_begin; item < item_end; ++item) {
         const int64_t b = item / channels;
@@ -1076,7 +1187,6 @@ void depthwise_conv_l2_custom(ggml_tensor* dst,
 
         // L2：通道间步进 nb[0]，时间间步进 nb[1]
         const uint8_t* x_channel = x_data + b * x->nb[2] + c * x->nb[0];
-        const uint8_t* w_channel = w_data + c * weight->nb[2];
         uint8_t* dst_channel = dst_data + b * dst->nb[2] + c * dst->nb[0];
 
         for (int64_t t = 0; t < t_len; ++t) {
@@ -1087,8 +1197,7 @@ void depthwise_conv_l2_custom(ggml_tensor* dst,
                     continue;
                 }
                 const float x_val = load_f32_scalar(x_channel + src_t * x->nb[1], x->type);
-                const float w_val = load_f32_scalar(w_channel + k * weight->nb[0], weight->type);
-                sum += x_val * w_val;
+                sum += x_val * w_at(c, k);
             }
             *reinterpret_cast<float*>(dst_channel + t * dst->nb[1]) = sum;
         }
@@ -1177,6 +1286,109 @@ inline float32x4_t snake_poly_sinv4(float32x4_t vx) {
 bool snake_fuse_enabled() {
     const char* e = std::getenv("VOXCPM_SNAKE_FUSED");
     return e == nullptr || e[0] != '0';   // 默认融合；=0 回退 5 节点（2G 需要）
+}
+
+// B2 A/B 开关：=0 时 dw 卷积用原始 F16 权重回退（标量路径）
+bool dw_f32_enabled() {
+    const char* e = std::getenv("VOXCPM_DW_F32");
+    return e == nullptr || e[0] != '0';
+}
+
+// B4：final conv k7（Cout=1）L2 核，替代 回L1 → im2col[672×T] → GEMM → permute
+// 老路径（~10MB/步 激活拷贝）。**因果**语义（与 causal_conv1d / dw 的
+// k*d − 2p 一致）：y[t] = b + Σ_c Σ_k w[c,k]·x[c, t+k−(K−1)]。
+// x [C, T, 1] F32（L2：同 t 的通道连续，沿 t 步进 nb[1]）；w [K, Cin, Cout=1]
+// （k 最快，c 步进 nb[1]）；b F32 派生。dst 与 x 同形（map_custom3 语义），
+// 结果只写第 0 通道（沿 t stride），调用侧 view 第 0 通道行。
+// 向量化沿连续通道（acc 4 lane 跨 c），每 t 跨通道归约一次。
+void final_conv_k7_l2_custom(ggml_tensor* dst,
+                             const ggml_tensor* x,
+                             const ggml_tensor* weight,
+                             const ggml_tensor* bias,
+                             int ith,
+                             int nth,
+                             void* userdata) {
+    GGML_UNUSED(userdata);
+    const int64_t channels = x->ne[0];
+    const int64_t t_len = x->ne[1];
+    const int64_t kernel = weight->ne[0];
+    const int64_t causal = kernel - 1;   // st = t + k − (K−1)，只看过去
+    VOXCPM_ASSERT(weight->ne[2] == 1 && weight->ne[1] == channels);
+    VOXCPM_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    VOXCPM_ASSERT(x->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const uint8_t* w_data = static_cast<const uint8_t*>(weight->data);
+    // 权重预取并转置：wt[k*C + c]（k 行、c 连续——与激活的通道连续向量化对齐）
+    float wt[96 * 7];
+    VOXCPM_ASSERT(channels * kernel <=
+                  static_cast<int64_t>(sizeof(wt) / sizeof(float)));
+    for (int64_t c = 0; c < channels; ++c) {
+        const uint8_t* wc = w_data + c * weight->nb[1];
+        for (int64_t k = 0; k < kernel; ++k) {
+            wt[k * channels + c] = load_f32_scalar(wc + k * weight->nb[0], weight->type);
+        }
+    }
+    const float bias_val = bias ? load_f32_scalar(static_cast<const uint8_t*>(bias->data), bias->type) : 0.0f;
+
+    // y[t] = dst 第 0 通道、时间步进 dst->nb[1]
+    float* y = reinterpret_cast<float*>(dst->data);
+    const int64_t y_stride = dst->nb[1] / sizeof(float);
+    const float* x_base = reinterpret_cast<const float*>(x->data);
+    const int64_t x_tstride = x->nb[1] / sizeof(float);   // 沿 t 的元素步进（= C）
+
+    const int64_t per = (t_len + nth - 1) / nth;
+    const int64_t t0 = ith * per;
+    const int64_t t1 = std::min(t0 + per, t_len);
+
+    const int64_t n_vec = channels / 4;
+    for (int64_t t = t0; t < t1; ++t) {
+#if defined(__ARM_NEON)
+        float32x4_t acc[96 / 4];
+        for (int64_t v = 0; v < n_vec; ++v) {
+            acc[v] = vdupq_n_f32(0.0f);
+        }
+        for (int64_t k = 0; k < kernel; ++k) {
+            const int64_t st = t + k - causal;
+            if (st < 0) {
+                continue;
+            }
+            const float* xk = x_base + st * x_tstride;
+            const float* wk = wt + k * channels;
+            for (int64_t v = 0; v < n_vec; ++v) {
+                acc[v] = vfmaq_f32(acc[v], vld1q_f32(xk + v * 4), vld1q_f32(wk + v * 4));
+            }
+        }
+        float32x4_t s = vdupq_n_f32(bias_val);
+        for (int64_t v = 0; v < n_vec; ++v) {
+            s = vaddq_f32(s, acc[v]);
+        }
+        float sum = vaddvq_f32(s);
+        // 标量尾（C % 4 ≠ 0；当前模型 C=96 不触发）
+        for (int64_t c = n_vec * 4; c < channels; ++c) {
+            for (int64_t k = 0; k < kernel; ++k) {
+                const int64_t st = t + k - causal;
+                if (st >= 0 && st < t_len) {
+                    sum += wt[k * channels + c] * x_base[st * x_tstride + c];
+                }
+            }
+        }
+        y[t * y_stride] = sum;
+#else
+        float sum = bias_val;
+        for (int64_t k = 0; k < kernel; ++k) {
+            const int64_t st = t + k - causal;
+            if (st < 0 || st >= t_len) {
+                continue;
+            }
+            const float* xk = x_base + st * x_tstride;
+            const float* wk = wt + k * channels;
+            for (int64_t c = 0; c < channels; ++c) {
+                sum += xk[c] * wk[c];
+            }
+        }
+        y[t * y_stride] = sum;
+#endif
+    }
 }
 
 }  // namespace
@@ -1281,7 +1493,13 @@ ggml_tensor* AudioVAE::residual_unit_forward_l2(ggml_context* ctx,
                               lookup_derived(std::string(weights.snake1_alpha->name) + "/f32"),
                               lookup_derived(std::string(weights.snake1_alpha->name) + "/f32/inv"),
                               snake_ops_);
-    h = ggml_map_custom3(ctx, h, weights.conv1_weight, weights.conv1_bias,
+    h = ggml_map_custom3(ctx, h,
+                         dw_f32_enabled()
+                             ? lookup_derived(std::string(weights.conv1_weight->name) + "/dwf32")
+                             : weights.conv1_weight,
+                         dw_f32_enabled()
+                             ? lookup_derived(std::string(weights.conv1_bias->name) + "/f32")
+                             : weights.conv1_bias,
                          depthwise_conv_l2_custom, GGML_N_TASKS_MAX, op_ptr);
     h = snake_l2(ctx, h,
                  lookup_derived(std::string(weights.snake2_alpha->name) + "/f32"),
@@ -1376,8 +1594,14 @@ ggml_tensor* AudioVAE::decode_tensor_l2(ggml_context* ctx, ggml_tensor* z,
         op->padding = 3;
         AudioVAEDepthwiseConvOpData* op_ptr = op.get();
         depthwise_ops_.push_back(std::move(op));
-        x = ggml_map_custom3(ctx, x, weights_.decoder_model_0_weight,
-                             weights_.decoder_model_0_bias, depthwise_conv_l2_custom,
+        x = ggml_map_custom3(ctx, x,
+                             dw_f32_enabled()
+                                 ? lookup_derived(std::string(weights_.decoder_model_0_weight->name) + "/dwf32")
+                                 : weights_.decoder_model_0_weight,
+                             dw_f32_enabled()
+                                 ? lookup_derived("decoder.model.0.bias/f32")
+                                 : weights_.decoder_model_0_bias,
+                             depthwise_conv_l2_custom,
                              GGML_N_TASKS_MAX, op_ptr);
     }
 
@@ -1396,12 +1620,15 @@ ggml_tensor* AudioVAE::decode_tensor_l2(ggml_context* ctx, ggml_tensor* z,
                                      config_.decoder_rates[i]);
     }
 
-    // final snake → 回 L1 → final conv k7（普通 conv，全 CPU 原路径）→ tanh
+    // final snake → final conv k7（B4：L2 自定义核，省 im2col ~10MB/步）→ tanh
     x = snake_l2(ctx, x, lookup_derived("decoder.final.alpha/f32"),
                  lookup_derived("decoder.final.alpha/f32/inv"), snake_ops_);
-    x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));   // [T, C, 1]
-    x = causal_conv1d(ctx, x, weights_.decoder_final_conv_weight,
-                      weights_.decoder_final_conv_bias, 7, 1, 1, 3);
+    x = ggml_map_custom3(ctx, x, weights_.decoder_final_conv_weight,
+                         lookup_derived("decoder.final.bias/f32"),
+                         final_conv_k7_l2_custom, GGML_N_TASKS_MAX, nullptr);
+    // dst 与 x 同形 [C,T]：取第 0 通道行 [1,T]（stride 视图，tanh 逐元素
+    // 支持 strided，无需 cont）
+    x = ggml_view_2d(ctx, x, 1, x->ne[1], x->nb[1], 0);
     return ggml_tanh(ctx, x);
 }
 
@@ -1539,8 +1766,10 @@ bool AudioVAEL2Plan::build(AudioVAE& vae, VoxCPMBackend& backend, int64_t t_len)
         // model.0 dw k7（pad 3）
         seg.dw_data.push_back(std::make_unique<AudioVAEDepthwiseConvOpData>(
             AudioVAEDepthwiseConvOpData{1, 1, 3}));
-        x = ggml_map_custom3(c, x, vae.weights().decoder_model_0_weight,
-                             vae.weights().decoder_model_0_bias, depthwise_conv_l2_custom,
+        x = ggml_map_custom3(c, x,
+                             vae.lookup_derived(std::string(vae.weights().decoder_model_0_weight->name) + "/dwf32"),
+                             vae.lookup_derived("decoder.model.0.bias/f32"),
+                             depthwise_conv_l2_custom,
                              GGML_N_TASKS_MAX, seg.dw_data.back().get());
 
         // model.1 pw k1 + bias
@@ -1663,10 +1892,11 @@ bool AudioVAEL2Plan::build(AudioVAE& vae, VoxCPMBackend& backend, int64_t t_len)
             }
             x = snake_l2(c, x, vae.lookup_derived("decoder.final.alpha/f32"),
                          vae.lookup_derived("decoder.final.alpha/f32/inv"), vae.snake_ops_);
-            x = ggml_cont(c, ggml_permute(c, x, 1, 0, 2, 3));   // 回 L1 [T, C]
-            x = vae.causal_conv1d(c, x, vae.weights().decoder_final_conv_weight,
-                                  vae.weights().decoder_final_conv_bias, 7, 1, 1, 3);
-            x = ggml_tanh(c, x);
+            // B4：final conv k7 L2 自定义核（省 im2col ~10MB/步 + 两次 permute）
+            x = ggml_map_custom3(c, x, vae.weights().decoder_final_conv_weight,
+                                 vae.lookup_derived("decoder.final.bias/f32"),
+                                 final_conv_k7_l2_custom, GGML_N_TASKS_MAX, nullptr);
+            x = ggml_tanh(c, ggml_view_2d(c, x, 1, x->ne[1], x->nb[1], 0));
             seg.output = x;
             seg.graph = seg.ctx.new_graph(512);
             ggml_build_forward_expand(seg.graph, seg.output);
