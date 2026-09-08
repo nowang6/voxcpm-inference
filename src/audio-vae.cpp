@@ -1559,12 +1559,25 @@ bool AudioVAEL2Plan::build(AudioVAE& vae, VoxCPMBackend& backend, int64_t t_len)
             return false;
         }
     }
+    // 段间搬运 scratch：按最大边界一次分配，run 循环中复用（避免每步 malloc）
+    size_t max_boundary = 0;
+    for (auto& seg : segs_) {
+        if (seg->output) {
+            max_boundary = std::max(max_boundary, ggml_nbytes(seg->output));
+        }
+        if (seg->output2) {
+            max_boundary = std::max(max_boundary, ggml_nbytes(seg->output2));
+        }
+    }
+    copy_scratch_.resize(max_boundary);
     return true;
 }
 
 ggml_status AudioVAEL2Plan::run(VoxCPMBackend& backend) {
     static int64_t prof_htp_us = 0, prof_cpu_us = 0, prof_copy_us = 0;
     static int64_t prof_n = 0;
+    static int64_t prof_seg_us[16] = {0};   // 每段累计（VOXCPM_PROFILE_SEGS=1 时打印）
+    static const bool prof_segs = std::getenv("VOXCPM_PROFILE_SEGS") != nullptr;
     const int64_t t_run0 = ggml_time_us();
     for (size_t i = 0; i < segs_.size(); ++i) {
         auto& seg = segs_[i];
@@ -1576,6 +1589,9 @@ ggml_status AudioVAEL2Plan::run(VoxCPMBackend& backend) {
         } else {
             prof_cpu_us += dt;
         }
+        if (i < 16) {
+            prof_seg_us[i] += dt;
+        }
         if (st != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "[l2plan] seg=%zu failed st=%d\n", i,
                          static_cast<int>(st));
@@ -1586,15 +1602,21 @@ ggml_status AudioVAEL2Plan::run(VoxCPMBackend& backend) {
             const int64_t tc0 = ggml_time_us();
             const ggml_tensor* out = segs_[i]->output;
             ggml_tensor* next_in = segs_[i + 1]->input;
-            std::vector<uint8_t> tmp(ggml_nbytes(out));
-            ggml_backend_tensor_get(out, tmp.data(), 0, tmp.size());
-            ggml_backend_tensor_set(next_in, tmp.data(), 0, tmp.size());
+            const size_t nb = ggml_nbytes(out);
+            if (nb > copy_scratch_.size()) {   // build 已按最大边界分配，防御性兜底
+                copy_scratch_.resize(nb);
+            }
+            ggml_backend_tensor_get(out, copy_scratch_.data(), 0, nb);
+            ggml_backend_tensor_set(next_in, copy_scratch_.data(), 0, nb);
             if (segs_[i]->output2 != nullptr) {
                 const ggml_tensor* out2 = segs_[i]->output2;
                 ggml_tensor* next_in2 = segs_[i + 1]->input2;
-                tmp.resize(ggml_nbytes(out2));
-                ggml_backend_tensor_get(out2, tmp.data(), 0, tmp.size());
-                ggml_backend_tensor_set(next_in2, tmp.data(), 0, tmp.size());
+                const size_t nb2 = ggml_nbytes(out2);
+                if (nb2 > copy_scratch_.size()) {
+                    copy_scratch_.resize(nb2);
+                }
+                ggml_backend_tensor_get(out2, copy_scratch_.data(), 0, nb2);
+                ggml_backend_tensor_set(next_in2, copy_scratch_.data(), 0, nb2);
             }
             prof_copy_us += ggml_time_us() - tc0;
         }
@@ -1612,6 +1634,16 @@ ggml_status AudioVAEL2Plan::run(VoxCPMBackend& backend) {
                      prof_cpu_us / 1000.0 / prof_n, prof_copy_us / 1000.0 / prof_n,
                      (prof_total_us / prof_n - prof_htp_us / prof_n -
                       prof_cpu_us / prof_n - prof_copy_us / prof_n) / 1000.0);
+        if (prof_segs) {
+            // seg0/2/4/6/8 CPU（头链/res 组装）、seg1/3/5/7 HTP（convT 双 GEMM）
+            std::fprintf(stderr, "[l2plan] segs:");
+            for (size_t i = 0; i < segs_.size() && i < 16; ++i) {
+                std::fprintf(stderr, " %c%zu=%.2f", segs_[i]->is_htp ? 'H' : 'C',
+                             i, prof_seg_us[i] / 1000.0 / prof_n);
+            }
+            std::fprintf(stderr, " (ms)\n");
+            std::memset(prof_seg_us, 0, sizeof(prof_seg_us));
+        }
         std::fflush(stderr);
         prof_htp_us = prof_cpu_us = prof_copy_us = 0;
         prof_total_us = 0;

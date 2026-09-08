@@ -279,6 +279,7 @@ public:
 private:
     struct Segment;
     std::vector<std::unique_ptr<Segment>> segs_;
+    std::vector<uint8_t> copy_scratch_;  // 段间搬运中转缓冲（build 时按最大边界一次分配）
     void* impl_ = nullptr;   // 段构建上下文（AudioVAE 内部使用）
 };
 
