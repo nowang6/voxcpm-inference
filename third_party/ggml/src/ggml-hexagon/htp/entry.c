@@ -163,6 +163,7 @@ static const char * htp_op_short_name(unsigned int op) {
         case HTP_OP_UNARY_EXP:       return "UNARY_EXP";
         case HTP_OP_UNARY_TANH:      return "UNARY_TANH";
         case HTP_OP_UNARY_ABS:       return "UNARY_ABS";
+        case HTP_OP_UNARY_SIN:       return "UNARY_SIN";
         case HTP_OP_UNARY_LOG:       return "UNARY_LOG";
         case HTP_OP_UNARY_SILU:      return "UNARY_SILU";
         case HTP_OP_UNARY_GELU:      return "UNARY_GELU";
@@ -780,6 +781,7 @@ static const htp_op_func_t g_op_dispatch[HTP_OP_INVALID] = {
     [HTP_OP_UNARY_TANH]      = op_unary,
     [HTP_OP_UNARY_ABS]       = op_unary,
     [HTP_OP_UNARY_LOG]       = op_unary,
+    [HTP_OP_UNARY_SIN]       = op_unary,
     [HTP_OP_L2_NORM]         = op_unary,
     [HTP_OP_UNARY_SILU]      = op_unary,
     [HTP_OP_UNARY_GELU]      = op_unary,
@@ -924,6 +926,7 @@ static int ggml_op_to_htp_op(int32_t ggml_op, const int32_t * op_params,
         case GGML_OP_DIAG:    *htp_op = HTP_OP_DIAG;        return 0;
         case GGML_OP_TRI:     *htp_op = HTP_OP_TRI;         return 0;
         case GGML_OP_SOLVE_TRI: *htp_op = HTP_OP_SOLVE_TRI; return 0;
+        case GGML_OP_SIN:     *htp_op = HTP_OP_UNARY_SIN;   return 0;
         case GGML_OP_UNARY: {
             if (!op_params) {
                 FARF(ERROR, "ggml_op_to_htp_op: UNARY missing op_params");
@@ -2138,10 +2141,18 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
         }
 
         GGMLHEXAGON_LOG_DEBUG("mempool-batch: op %u/%u opc=%d", i, hdr->n_ops, op->opcode);
+        FARF(ERROR, "DSP-TRACE op%u/%u opc=%d htp_opcode=%d", i, hdr->n_ops, op->opcode, op->htp_opcode);
 
         // Translation layer: map GGML op to HTP op, build octx, call execute_op.
         // For fused ops, AP sets htp_opcode directly (skip ggml_op_to_htp_op).
         enum htp_op_code htp_op;
+        // DSP-PROBE: record progress in the shared batch header (AP reads it on
+        // failure). reserved is unused otherwise.
+        {
+            struct hex_batch_hdr * hdr_w = (struct hex_batch_hdr *)(base + batch_offset);
+            hdr_w->reserved = 0xDEAD0000u | (uint32_t)(op->htp_opcode & 0xFFu) | ((uint32_t)(op->opcode & 0xFF) << 16);
+            ggml_htp_cache_flush_range(hdr_w, sizeof(*hdr_w));
+        }
         if (op->htp_opcode != 0) {
             htp_op = (enum htp_op_code) op->htp_opcode;
         } else if (ggml_op_to_htp_op(op->opcode, op->params, &htp_op) != 0) {
@@ -2209,6 +2220,12 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
 #endif
 
         int op_ret = execute_op(&octx);
+        // DSP-PROBE: record the op result so the AP can read the true failure
+        {
+            struct hex_batch_hdr * hdr_w2 = (struct hex_batch_hdr *)(base + batch_offset);
+            hdr_w2->reserved = 0xCEEE0000u | (uint32_t)(op_ret & 0xFFu) | ((uint32_t)((octx.op) & 0xFF) << 8);
+            ggml_htp_cache_flush_range(hdr_w2, sizeof(*hdr_w2));
+        }
 
 #ifndef NDEBUG
         /* F32 MUL_MAT diagnostic: dump dst[0..3] and dst[16..19] AFTER execute_op. */

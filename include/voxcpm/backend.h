@@ -15,10 +15,15 @@
 namespace voxcpm {
 
 /**
- * @brief Backend type enumeration（本项目为纯 CPU 构建，仅保留 CPU）
+ * @brief Backend type enumeration
+ *
+ * CPU: 纯 CPU 执行（原有路径，gallocr 计算缓冲）
+ * HTP: CPU+HTP 异构执行（ggml_backend_sched 调度，HTP0 优先 + CPU 兜底）。
+ *      设备不可用时自动回退 CPU，type() 反映实际生效值。
  */
 enum class BackendType {
     CPU,
+    HTP,
 };
 
 /**
@@ -167,6 +172,22 @@ public:
     ggml_backend_buffer_type_t buffer_type() const;
 
     /**
+     * @brief Get HTP device buffer type（异构模式下权重/持久张量的落点）
+     * @return HTP buft；纯 CPU 模式返回 nullptr
+     */
+    ggml_backend_buffer_type_t htp_buffer_type() const { return htp_buft_; }
+
+    /**
+     * @brief 是否处于 CPU+HTP 异构模式（sched 路径生效）
+     */
+    bool is_htp_active() const { return htp_backend_ != nullptr; }
+
+    /**
+     * @brief HTP backend 句柄（异构模式下供拆段计划直接下发单后端图）
+     */
+    ggml_backend_t htp_backend() const { return htp_backend_; }
+
+    /**
      * @brief Get current compute arena size in bytes
      */
     size_t compute_buffer_size() const;
@@ -187,14 +208,25 @@ public:
     const char* backend_description() const { return backend_description_.c_str(); }
 
 private:
-    BackendType type_;
+    BackendType type_;                                   // 实际生效（HTP 失败时回退 CPU）
     int n_threads_;
-    ggml_backend_t backend_;
-    ggml_gallocr_t gallocr_;
+    ggml_backend_t backend_;                             // CPU backend（始终存在）
+    ggml_gallocr_t gallocr_;                             // CPU-only 计算缓冲
+    ggml_backend_t htp_backend_ = nullptr;               // HTP backend（可空）
+    ggml_backend_buffer_type_t htp_buft_ = nullptr;      // HTP 设备 buft
+    ggml_backend_sched_t sched_ = nullptr;               // 异构调度器（与当前图绑定）
     bool allocator_logging_enabled_ = false;
     std::string backend_name_;
     std::string
     backend_description_;
+
+    /**
+     * @brief 重建异构 sched 并为 graph reserve（HTP 模式的 reserve_compute_memory）
+     *
+     * 当前 mock 每步重建图 → sched 需随之重建；图复用（Stage 2d）后此函数
+     * 整个推理过程只被调用一次。
+     */
+    void sched_reset_for(ggml_cgraph* graph);
 };
 
 }  // namespace voxcpm

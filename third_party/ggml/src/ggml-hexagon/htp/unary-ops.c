@@ -15,6 +15,11 @@
 #include "hvx-utils.h"
 #include "unary-ops.h"
 
+// QHL HVX math library (prebuilt, per-DSP-arch): sin kernel implementation
+#if defined(__hexagon__)
+#include "qhmath_hvx/qhmath_hvx.h"
+#endif
+
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
 #include "htp-ctx.h"
@@ -611,6 +616,22 @@ static void log_f32(const float * restrict src,
     }
 }
 
+// SIN: QHL HVX kernel (qhmath_hvx_sin_af) takes unaligned float pointers and the
+// full input range, so no pre-scaled range reduction is needed on our side.
+static void sin_f32(const float * restrict src,
+                    float * restrict dst,
+                    const uint32_t num_rows,
+                    const struct htp_unary_context * uctx) {
+    htp_unary_op_preamble;
+
+    for (uint32_t ir = 0; ir < num_rows; ir++) {
+        const float * restrict src_local = (const float *)((const uint8_t *)src + (ir * src0_row_size_aligned));
+        float * restrict dst_local       = (float *)((uint8_t *)dst + (ir * dst_row_size_aligned));
+
+        qhmath_hvx_sin_af((float * restrict) src_local, dst_local, ne0);
+    }
+}
+
 #define DEFINE_UNARY_TASK_IMPL(NAME, TYPE, SUFFIX, IS_RMS_NORM_MUL, IS_TRI, CORE_EXPR)                              \
 static void unary_task_##SUFFIX##_##NAME(unsigned int nth, unsigned int ith, void * data) {                         \
     const struct htp_unary_context * uctx = (const struct htp_unary_context *) data;                                \
@@ -785,6 +806,7 @@ DEFINE_UNARY_TASK(unary_softplus, false, false, softplus_f32(src0_vtcm, dst_vtcm
 DEFINE_UNARY_TASK(unary_tanh,     false, false, tanh_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_abs,      false, false, abs_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(unary_log,      false, false, log_f32(src0_vtcm, dst_vtcm, block_size, uctx))
+DEFINE_UNARY_TASK(unary_sin,      false, false, sin_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(l2_norm,        false, false, l2_norm_f32(src0_vtcm, dst_vtcm, block_size, uctx))
 DEFINE_UNARY_TASK(tri,            false, true,  tri_f32(src0_vtcm, dst_vtcm, block_size, ir, uctx))
 
@@ -1046,6 +1068,8 @@ DEFINE_UNARY_TILED_TASK(unary_softplus, false, tile_unary_softplus_f32(dst_vtcm,
 DEFINE_UNARY_TILED_TASK(unary_tanh,     false, hvx_tanh_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_abs,      false, hvx_abs_f32_aa(dst_vtcm, src_vtcm, tw))
 DEFINE_UNARY_TILED_TASK(unary_log,      false, hvx_log_f32_aa(dst_vtcm, src_vtcm, tw))
+// SIN tiled path: TEMP scalar loop to bisect QHL-vs-wiring (see P0 notes)
+DEFINE_UNARY_TILED_TASK(unary_sin,      false, do { for (uint32_t _i = 0; _i < (tw); ++_i) ((float *) dst_vtcm)[_i] = sinf(((const float *) src_vtcm)[_i]); } while (0))
 DEFINE_UNARY_TILED_TASK(tri,            true,  tri_apply_tile_f32(src_vtcm, dst_vtcm, tw, col, i01, ne0, tri_ttype))
 
 static int execute_op_unary(struct htp_ops_context * octx) {
@@ -1075,6 +1099,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
         case HTP_OP_UNARY_TANH:      op_type = "tanh-f32";                                   break;
         case HTP_OP_UNARY_ABS:       op_type = is_f16 ? "abs-f16"      : "abs-f32";          break;
         case HTP_OP_UNARY_LOG:       op_type = is_f16 ? "log-f16"      : "log-f32";          break;
+        case HTP_OP_UNARY_SIN:       op_type = "sin-f32";                                    break;
         case HTP_OP_L2_NORM:         op_type = is_f16 ? "l2norm-f16"   : "l2norm-f32";       break;
         case HTP_OP_TRI:             op_type = "tri-f32";                                    break;
 
@@ -1201,6 +1226,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_tiled_unary_tanh;     break;
                 case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_tiled_unary_abs;      break;
                 case HTP_OP_UNARY_LOG:       task_func = unary_task_f32_tiled_unary_log;      break;
+                case HTP_OP_UNARY_SIN:       task_func = unary_task_f32_tiled_unary_sin;      break;
                 case HTP_OP_TRI:             task_func = unary_task_f32_tiled_tri;            break;
                 default:                     break;
             }
@@ -1233,6 +1259,7 @@ static int execute_op_unary(struct htp_ops_context * octx) {
                 case HTP_OP_UNARY_GELU:      task_func = unary_task_f32_unary_gelu;           break;
                 case HTP_OP_UNARY_SOFTPLUS:  task_func = unary_task_f32_unary_softplus;       break;
                 case HTP_OP_UNARY_TANH:      task_func = unary_task_f32_unary_tanh;           break;
+                case HTP_OP_UNARY_SIN:       task_func = unary_task_f32_unary_sin;            break;
                 case HTP_OP_UNARY_ABS:       task_func = unary_task_f32_unary_abs;            break;
                 case HTP_OP_UNARY_LOG:       task_func = unary_task_f32_unary_log;            break;
                 case HTP_OP_L2_NORM:         task_func = unary_task_f32_l2_norm;              break;

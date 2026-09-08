@@ -2925,6 +2925,7 @@ static bool ggml_hexagon_compute_fa_params(
 // htp_op_is_unary() in unary-ops.h accepts.
 // Returns false if the op is not a precompute-required unary.
 static bool ggml_op_to_htp_op_unary(int32_t ggml_op, const int32_t * op_params, uint32_t * htp_op) {
+    GGMLHEXAGON_LOG_ALWAYS("diag: op_to_htp_op_unary entry ggml_op=%d", (int)ggml_op);
     switch (ggml_op) {
         case GGML_OP_NORM:    *htp_op = HTP_OP_NORM;        return true;
         case GGML_OP_L2_NORM: *htp_op = HTP_OP_L2_NORM;     return true;
@@ -2934,6 +2935,10 @@ static bool ggml_op_to_htp_op_unary(int32_t ggml_op, const int32_t * op_params, 
         case GGML_OP_SQRT:    *htp_op = HTP_OP_SQRT;        return true;
         case GGML_OP_LOG:     *htp_op = HTP_OP_UNARY_LOG;   return true;
         case GGML_OP_TRI:     *htp_op = HTP_OP_TRI;         return true;
+        case GGML_OP_SIN:
+            GGMLHEXAGON_LOG_ALWAYS("diag: SIN case hit in ggml_op_to_htp_op_unary");
+            *htp_op = HTP_OP_UNARY_SIN;
+            return true;
         case GGML_OP_UNARY:
             if (!op_params) return false;
             switch (op_params[0]) {
@@ -4124,6 +4129,24 @@ static bool hexagon_validate_unary(ggml_backend_hexagon_context * ctx, const ggm
     }
 }
 
+// GGML_OP_SIN (standalone op in ggml v0.22, not a GGML_OP_UNARY subtype) via
+// the QHL qhmath_hvx_sin_af kernel: F32 in/out, same shape, contiguous dst.
+static bool hexagon_validate_sin(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
+    GGML_UNUSED(ctx);
+    std::fprintf(stderr, "[sin-validate] called\n");
+    std::fflush(stderr);
+    const ggml_tensor * src0 = op->src[0];
+    if (src0->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32)
+        return false;
+    if (ggml_is_permuted(src0))
+        return false;
+    if (!ggml_are_same_shape(src0, op))
+        return false;
+    if (!ggml_is_contiguous(op))
+        return false;
+    return true;
+}
+
 static bool hexagon_validate_glu(ggml_backend_hexagon_context * ctx, const ggml_tensor * op) {
     GGML_UNUSED(ctx);
     const ggml_tensor * src0 = op->src[0];
@@ -4447,6 +4470,7 @@ static void init_op_validators(void) {
     s_op_validators[GGML_OP_ROPE]           = hexagon_validate_rope;
     s_op_validators[GGML_OP_SOFT_MAX]       = hexagon_validate_soft_max;
     s_op_validators[GGML_OP_UNARY]          = hexagon_validate_unary;
+    s_op_validators[GGML_OP_SIN]            = hexagon_validate_sin;
     s_op_validators[GGML_OP_GLU]            = hexagon_validate_glu;
     s_op_validators[GGML_OP_SCALE]          = hexagon_validate_scale;
     s_op_validators[GGML_OP_CPY]            = hexagon_validate_cpy;
@@ -6133,6 +6157,16 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     }
 
     GGMLHEXAGON_LOG_DEBUG("mempool-batch: submitted offset=0x%x size=%u (%u ops, %u tensors)", batch_offset, total_desc_size, n_ops, n_tensors);
+    {
+        // TEMP diag: read back serialized op descriptors to verify opcodes
+        const hex_batch_hdr * hdr_chk = (const hex_batch_hdr *)((const char *)ctx->rpc_mempool + batch_offset);
+        const hex_op_desc * ops_chk = (const hex_op_desc *)((const char *)ctx->rpc_mempool + batch_offset + hdr_chk->ops_offset);
+        for (uint32_t di = 0; di < n_ops; ++di) {
+            GGMLHEXAGON_LOG_ALWAYS("diag op%u: opcode=%d htp_opcode=%d n_src0=%d",
+                                   di, (int)ops_chk[di].opcode, (int)ops_chk[di].htp_opcode,
+                                   (int)ops_chk[di].src_idx[0]);
+        }
+    }
 
     t_p8 = ggml_time_us() - t_prev; t_prev = ggml_time_us();
 
@@ -6173,6 +6207,13 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
 
     if (AEE_SUCCESS != hexagon_error) {
         GGMLHEXAGON_LOG_WARN("ggml_htp_execute_batch failed: 0x%x", hexagon_error);
+        // DSP-PROBE readback: last op progress recorded by the DSP in hdr.reserved
+        {
+            const hex_batch_hdr * hdr_chk = (const hex_batch_hdr *)((const char *)ctx->rpc_mempool + batch_offset);
+            GGMLHEXAGON_LOG_ALWAYS("diag probe: reserved=0x%x (dsp htp_op=%u ggml_op=%u)",
+                                   hdr_chk->reserved, hdr_chk->reserved & 0xFF,
+                                   (hdr_chk->reserved >> 16) & 0xFF);
+        }
         result =  GGML_STATUS_FAILED;
     }
 

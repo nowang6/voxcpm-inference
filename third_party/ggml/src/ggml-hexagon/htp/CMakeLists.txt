@@ -6,11 +6,15 @@ include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
 include_directories(
     ${HEXAGON_SDK_ROOT}/incs
     ${HEXAGON_SDK_ROOT}/incs/stddef
+    ${HEXAGON_SDK_ROOT}/libs/qhl_hvx/inc
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../..
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR})
+
+# QHL HVX math kernels (prebuilt per DSP arch; used by unary SIN)
+set(QHL_HVX_MATH_LIB "${HEXAGON_SDK_ROOT}/libs/qhl_hvx/prebuilt/hexagon_toolv19_${DSP_VERSION}/libqhmath_hvx.a")
 
 # Op sources shared by both skel variants (dspqueue entry via main.c and
 # mempool/FastRPC-invoke entry via entry.c). Entry points and glue differ per variant.
@@ -64,6 +68,8 @@ if (GGML_HEXAGON_USE_MEMPOOL)
 
     target_compile_options(${HTP_LIB} PRIVATE -Wno-error)
 
+    target_link_libraries(${HTP_LIB} PRIVATE ${QHL_HVX_MATH_LIB})
+
     build_idl(ggml_htp.idl ${HTP_LIB})
 
     set_target_properties(${HTP_LIB} PROPERTIES EXPORT_COMPILE_COMMANDS ON)
@@ -83,6 +89,8 @@ else()
         $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
         $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,FARF_HIGH=1,>
     )
+
+    target_link_libraries(${HTP_LIB} PRIVATE ${QHL_HVX_MATH_LIB})
 
     build_idl(htp_iface.idl ${HTP_LIB})
 

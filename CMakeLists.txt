@@ -27,7 +27,13 @@ find_package(Threads REQUIRED)
 set(GGML_DIR ${CMAKE_SOURCE_DIR}/third_party/ggml)
 set(GGML_CUDA OFF CACHE BOOL "ggml: use CUDA" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "ggml: use Vulkan" FORCE)
-set(GGML_NATIVE ON CACHE BOOL "ggml: optimize the build for the current system" FORCE)
+# 交叉编译（Android/NDK）下 GGML_NATIVE 会探测 -mcpu=native，NDK clang 不支持，
+# 强制 OFF 走基线 armv8-a（CPU 侧仅承担 sin 等非 GEMM op，基线足够）
+if(CMAKE_CROSSCOMPILING)
+    set(GGML_NATIVE OFF CACHE BOOL "ggml: optimize the build for the current system" FORCE)
+else()
+    set(GGML_NATIVE ON CACHE BOOL "ggml: optimize the build for the current system" FORCE)
+endif()
 # vendored 子树已剪裁 examples/ tests/ 目录，显式关掉对应开关
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "ggml: build examples" FORCE)
 set(GGML_BUILD_TESTS    OFF CACHE BOOL "ggml: build tests"    FORCE)
@@ -68,13 +74,16 @@ endif()
 
 add_subdirectory(${GGML_DIR} ggml)
 
-# x86_64 宿主编译器（gcc<12 / clang 需 AVX512FP16）不支持 _Float16，而 AP 侧
-# ggml-hexagon 经 htp/unary-ops.h 仅用到 sizeof(_Float16)（==2），用 uint16_t
-# 等宽替换即可在宿主机完成编译冒烟；DSP 侧经 hexagon-clang 交叉编译不受影响，
-# aarch64 目标编译器原生支持 _Float16，此定义不会生效
-if(TARGET ggml-hexagon AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+# 宿主编译器不支持 _Float16 时（x86_64 无 AVX512FP16，或 aarch64 gcc 在默认
+# -march=armv8-a 下），AP 侧 ggml-hexagon 经 htp/unary-ops.h 仅用到
+# sizeof(_Float16)（==2），用 uint16_t 等宽替换即可完成编译；DSP 侧经
+# hexagon-clang 交叉编译不受影响
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("int main(){ _Float16 x = 1; return (int)x; }"
+    VOXCPM_HAVE_FLOAT16)
+if(TARGET ggml-hexagon AND NOT VOXCPM_HAVE_FLOAT16)
     target_compile_definitions(ggml-hexagon PRIVATE _Float16=uint16_t)
-    message(STATUS "voxcpm: x86_64 宿主编译 ggml-hexagon，注入 _Float16=uint16_t 等宽替换")
+    message(STATUS "voxcpm: 宿主编译器无 _Float16，注入 _Float16=uint16_t 等宽替换")
 endif()
 
 # mempool 变体的 ggml-hexagon-fastrpc.cpp 使用 std::filesystem 但未 include
@@ -132,3 +141,11 @@ target_link_libraries(voxcpm-vae-decode-mock PRIVATE voxcpm)
 
 add_executable(voxcpm-vae-dump-tensor-check dump_tensor_check.cpp)
 target_link_libraries(voxcpm-vae-dump-tensor-check PRIVATE voxcpm)
+
+# =============================================================================
+# voxcpm-htp-smoke: HTP 算子冒烟。GGML_HEXAGON=OFF 构建时无 HTP 设备，
+# 自动退化为纯 CPU 自检模式（仅验证图构建/视图/截尾语义，两路逐位一致）
+# =============================================================================
+
+add_executable(voxcpm-htp-smoke htp_smoke.cpp)
+target_link_libraries(voxcpm-htp-smoke PRIVATE voxcpm)
