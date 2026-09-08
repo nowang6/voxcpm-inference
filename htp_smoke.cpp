@@ -24,6 +24,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "voxcpm/audio-vae.h"
 
 #include <algorithm>
 #include <cmath>
@@ -545,6 +546,65 @@ bool test_snake_chain(int C, int T) {
   // 逐位不可达：host 侧 -O3 默认 -ffp-contract=fast 会把 x + av*av*iv 融合成 FMA，
   // 与图中分离的 mul/add 相差 1 ulp 级；1e-5 仍足以甄别图语义错误
   const bool pass = c.rel_rms() <= 1e-5 && c.max_abs <= 1e-4;
+  report(name, pass, c, splits);
+  return pass;
+}
+
+// =============================================================================
+// T14：融合 snake 自定义算子（B1）：y = x + inv·sin²(alpha·x)
+//      多项式 sin vs std::sin 参考；纯 CPU 执行（MAP_CUSTOM1 不上 HTP）；
+//      覆盖常态 |αx|<π 范围与 |αx|>1e4 的 libm 回退分支
+// =============================================================================
+
+bool test_snake_fused(int C, int T) {
+  char name[64];
+  std::snprintf(name, sizeof(name), "T14 snake-fused [%d,%d]", C, T);
+
+  std::vector<float> x(static_cast<size_t>(C) * T), a(C), iv(C);
+  fill_rnd(x, -8.0f, 8.0f);
+  fill_rnd(a, 0.5f, 2.0f);
+  for (int i = 0; i < C; ++i) {
+    iv[i] = 1.0f / (a[i] + 1e-9f);
+  }
+  x[0] = 2e4f;                        // |αx| 最高 4e4：触发 libm 回退分支
+  x[1] = -2e4f;
+  if (static_cast<size_t>(C) * T > 16) {
+    x[16] = 8e3f;                     // 边界附近（α=2 时 1.6e4 恰好回退）
+  }
+
+  voxcpm::AudioVAESnakeOpData op{a.data(), iv.data()};
+
+  CtxGuard wctx;
+  wctx.reset(4, 0);
+  ggml_tensor* xt = ggml_new_tensor_2d(wctx.ctx, GGML_TYPE_F32, C, T);
+  if (!alloc_weights(wctx.ctx, g.cpu_buft)) {
+    report_fail(name, "CPU weights alloc failed");
+    return false;
+  }
+  set_f32(xt, x);
+
+  Graph G;
+  G.init(8, 8);
+  ggml_build_forward_expand(
+      G.g, ggml_map_custom1(G.ctx.ctx, xt, &voxcpm::snake_fused_l2_custom,
+                            GGML_N_TASKS_MAX, &op));
+
+  std::vector<float> ref(x.size());
+  for (size_t i = 0; i < x.size(); ++i) {
+    const size_t c = i % static_cast<size_t>(C);
+    const float s = std::sin(a[c] * x[i]);
+    ref[i] = x[i] + s * s * iv[c];
+  }
+
+  std::vector<float> got;
+  const int splits = run_graph({g.cpu}, G.g, [] {},
+                               [&](ggml_cgraph*) { get_f32(last_node(G.g), got); });
+  if (splits < 0) {
+    report_fail(name, "compute failed");
+    return false;
+  }
+  const Compare c = compare(ref, got);
+  const bool pass = c.max_abs <= 1e-5 && c.rel_rms() <= 1e-6;  // 多项式截断 <1e-11
   report(name, pass, c, splits);
   return pass;
 }
@@ -1262,6 +1322,9 @@ int main() {
   ok &= test_concat(768, 8, 6);
   // T5：snake 链
   ok &= test_snake_chain(384, 384);
+  // T14：融合 snake（B1，纯 CPU 多项式 sin vs std::sin）
+  ok &= test_snake_fused(96, 3840);
+  ok &= test_snake_fused(384, 48);
   // T6/T7
   ok &= test_get_rows(384, 100, 12);
   ok &= test_tanh(96, 3840);

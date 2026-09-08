@@ -12,12 +12,21 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 namespace voxcpm {
+
+// 融合 snake 自定义算子的参数：alpha/inv 为 [C] F32 派生权重（CPU buffer，
+// ensure_derived_weights 分配后 data 指针稳定，图构建期即可捕获）。
+// 定义见 audio-vae.h（htp_smoke T14 复用回调）。
 
 struct AudioVAEDepthwiseConvOpData {
     int stride = 1;
@@ -1086,10 +1095,107 @@ void depthwise_conv_l2_custom(ggml_tensor* dst,
     }
 }
 
-// L2 snake（5 节点）：y = x + sin(x·a)²·inv，alpha/inv 以 [C,1,1] 视图广播。
-// sin 留 CPU，其余节点可上 HTP。
+// ---- 融合 snake 的多项式 sin（B1）----
+// 归约：Cody-Waite 三部 π/2；|x| > kSnakeBigFallback 回退 std::sin 保精度。
+// 回退界取 1024：此时 q = x·2/π ≤ 652（10 位），q·hi（hi 尾数 11 位）需 21 位
+// < float 24 位 → 乘法绝对精确；更大的界会使 q·hi 丢低位（T14 实测 x≈4e3 时
+// 误差达 ulp(4096)≈4.9e-4）。snake 的 α·x 实测远小于此界，回退几乎不触发。
+// 多项式：[-π/4,π/4] Taylor（sin 到 r¹³、cos 到 r¹²），截断误差 <1e-11，
+// 远低于端到端预算（SNR ≥35dB / max|Δ| ≤1e-2），htp_smoke T14 对拍验证。
+namespace {
+
+constexpr float kSnake2OverPi = 0.6366197723675814f;
+constexpr float kSnakePi2Hi = 1.5703125f;                 // π/2 高 11 位（q*hi 尾数精确）
+constexpr float kSnakePi2Mid = 4.83751296997070312e-4f;
+constexpr float kSnakePi2Lo = 6.42041082529574494e-11f;
+constexpr float kSnakeBigFallback = 1024.0f;
+
+inline float snake_poly_sinf(float x) {
+    if (std::fabs(x) > kSnakeBigFallback) {
+        return std::sin(x);   // NaN 也走此路（libm 语义）
+    }
+    const float q = std::nearbyintf(x * kSnake2OverPi);
+    float r = x - q * kSnakePi2Hi;
+    r -= q * kSnakePi2Mid;
+    r -= q * kSnakePi2Lo;
+    const int qi = static_cast<int>(q);
+    const float r2 = r * r;
+    // sin(r) = r + r³·S(r²)，cos(r) = 1 + r²·C(r²)（Horner，Taylor 系数）
+    float s = -2.5053763505e-08f;
+    s = 2.7557314297e-06f + r2 * s;
+    s = -1.9841270114e-04f + r2 * s;
+    s = 8.3333337680e-03f + r2 * s;
+    s = -1.6666667163e-01f + r2 * s;
+    const float sin_r = r + r * r2 * s;
+    float c = -2.7556946266e-07f;
+    c = 2.4801587646e-05f + r2 * c;
+    c = -1.3888889225e-03f + r2 * c;
+    c = 4.1666667908e-02f + r2 * c;
+    c = -4.9999999502e-01f + r2 * c;
+    const float cos_r = 1.0f + r2 * c;
+    const float v = (qi & 1) ? cos_r : sin_r;
+    return (qi & 2) ? -v : v;
+}
+
+#if defined(__ARM_NEON)
+inline float32x4_t snake_poly_sinv4(float32x4_t vx) {
+    if (vmaxvq_f32(vabsq_f32(vx)) > kSnakeBigFallback) {   // 罕见：整块回退标量
+        alignas(16) float xi[4], xo[4];
+        vst1q_f32(xi, vx);
+        for (int i = 0; i < 4; ++i) {
+            xo[i] = snake_poly_sinf(xi[i]);
+        }
+        return vld1q_f32(xo);
+    }
+    const float32x4_t q = vrndq_f32(vmulq_n_f32(vx, kSnake2OverPi));
+    float32x4_t r = vfmsq_n_f32(vx, q, kSnakePi2Hi);       // x - q·hi
+    r = vfmsq_n_f32(r, q, kSnakePi2Mid);
+    r = vfmsq_n_f32(r, q, kSnakePi2Lo);
+    const int32x4_t qi = vcvtq_s32_f32(q);
+    const float32x4_t r2 = vmulq_f32(r, r);
+    float32x4_t s = vdupq_n_f32(-2.5053763505e-08f);
+    s = vfmaq_f32(vdupq_n_f32(2.7557314297e-06f), r2, s);
+    s = vfmaq_f32(vdupq_n_f32(-1.9841270114e-04f), r2, s);
+    s = vfmaq_f32(vdupq_n_f32(8.3333337680e-03f), r2, s);
+    s = vfmaq_f32(vdupq_n_f32(-1.6666667163e-01f), r2, s);
+    const float32x4_t sin_r = vfmaq_f32(r, vmulq_f32(r, r2), s);
+    float32x4_t c = vdupq_n_f32(-2.7556946266e-07f);
+    c = vfmaq_f32(vdupq_n_f32(2.4801587646e-05f), r2, c);
+    c = vfmaq_f32(vdupq_n_f32(-1.3888889225e-03f), r2, c);
+    c = vfmaq_f32(vdupq_n_f32(4.1666667908e-02f), r2, c);
+    c = vfmaq_f32(vdupq_n_f32(-4.9999999502e-01f), r2, c);
+    const float32x4_t cos_r = vfmaq_f32(vdupq_n_f32(1.0f), r2, c);
+    // 奇象限取 cos 多项式；q 的 bit1 决定符号（sin 的对称性）
+    const uint32x4_t qu = vreinterpretq_u32_s32(qi);
+    const uint32x4_t odd_eq_zero = vceqq_u32(vandq_u32(qu, vdupq_n_u32(1)), vdupq_n_u32(0));
+    const float32x4_t v = vbslq_f32(odd_eq_zero, sin_r, cos_r);
+    const uint32x4_t sign = vshlq_n_u32(vandq_u32(qu, vdupq_n_u32(2)), 30);
+    return vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(v), sign));
+}
+#endif  // __ARM_NEON
+
+bool snake_fuse_enabled() {
+    const char* e = std::getenv("VOXCPM_SNAKE_FUSED");
+    return e == nullptr || e[0] != '0';   // 默认融合；=0 回退 5 节点（2G 需要）
+}
+
+}  // namespace
+
+// L2 snake：默认融合单节点（Neon 多项式 sin）；VOXCPM_SNAKE_FUSED=0 时回退
+// 5 节点链（MUL→SIN→SQR→MUL→ADD，sin 可上 HTP——供 2G/DSP-SIN 路线用）。
+// holder 由调用方（AudioVAE 成员函数）传入，持有 op data 至图生命周期结束。
 ggml_tensor* snake_l2(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha_f32,
-                      ggml_tensor* inv_f32) {
+                      ggml_tensor* inv_f32,
+                      std::deque<std::unique_ptr<AudioVAESnakeOpData>>& holder) {
+    if (snake_fuse_enabled()) {
+        VOXCPM_ASSERT(alpha_f32->type == GGML_TYPE_F32 && inv_f32->type == GGML_TYPE_F32);
+        auto op = std::make_unique<AudioVAESnakeOpData>();
+        op->alpha = static_cast<const float*>(alpha_f32->data);
+        op->inv = static_cast<const float*>(inv_f32->data);
+        void* op_ptr = op.get();
+        holder.push_back(std::move(op));
+        return ggml_map_custom1(ctx, x, snake_fused_l2_custom, GGML_N_TASKS_MAX, op_ptr);
+    }
     const int64_t channels = ggml_nelements(alpha_f32);
     ggml_tensor* a3 = ggml_reshape_3d(ctx, alpha_f32, channels, 1, 1);
     ggml_tensor* i3 = ggml_reshape_3d(ctx, inv_f32, channels, 1, 1);
@@ -1118,6 +1224,48 @@ ggml_tensor* pointwise_l2(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w_q4_0
 
 }  // namespace
 
+// 融合 snake：y[c] = x[c] + inv[c]·sin²(alpha[c]·x[c])，单节点替代
+// MUL→SIN→SQR→MUL→ADD 五节点（省 4 次全尺寸临时物化 + 标量 libm sin）。
+// 沿 L2 连续通道 Neon 4×F32；按 t 行切分线程。（定义在匿名 namespace 外，
+// htp_smoke T14 经 audio-vae.h 声明复用。）
+void snake_fused_l2_custom(ggml_tensor* dst, const ggml_tensor* x,
+                           int ith, int nth, void* userdata) {
+    const auto* op = static_cast<const AudioVAESnakeOpData*>(userdata);
+    const int64_t channels = x->ne[0];   // L2：通道在 ne[0]（连续）
+    const int64_t t_len = x->ne[1];
+    const int64_t batch = x->ne[2];
+    VOXCPM_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    VOXCPM_ASSERT(x->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const int64_t rows = t_len * batch;
+    const int64_t rows_per = (rows + nth - 1) / nth;
+    const int64_t r0 = ith * rows_per;
+    const int64_t r1 = std::min(r0 + rows_per, rows);
+
+    for (int64_t row = r0; row < r1; ++row) {
+        const int64_t b = row / t_len;
+        const int64_t t = row % t_len;
+        const float* xr = reinterpret_cast<const float*>(static_cast<const uint8_t*>(x->data) + b * x->nb[2] + t * x->nb[1]);
+        float* yr = reinterpret_cast<float*>(static_cast<uint8_t*>(dst->data) + b * dst->nb[2] + t * dst->nb[1]);
+        const float* alpha = op->alpha;
+        const float* inv = op->inv;
+        int64_t c = 0;
+#if defined(__ARM_NEON)
+        for (; c + 4 <= channels; c += 4) {
+            const float32x4_t a = vld1q_f32(alpha + c);
+            const float32x4_t iv = vld1q_f32(inv + c);
+            const float32x4_t v = vld1q_f32(xr + c);
+            const float32x4_t s = snake_poly_sinv4(vmulq_f32(a, v));
+            vst1q_f32(yr + c, vfmaq_f32(v, vmulq_f32(s, s), iv));   // x + s²·inv
+        }
+#endif
+        for (; c < channels; ++c) {
+            const float s = snake_poly_sinf(alpha[c] * xr[c]);
+            yr[c] = xr[c] + s * s * inv[c];
+        }
+    }
+}
+
 ggml_tensor* AudioVAE::residual_unit_forward_l2(ggml_context* ctx,
                                                 ggml_tensor* x,
                                                 const ResidualUnitWeights& weights,
@@ -1131,12 +1279,14 @@ ggml_tensor* AudioVAE::residual_unit_forward_l2(ggml_context* ctx,
 
     ggml_tensor* h = snake_l2(ctx, x,
                               lookup_derived(std::string(weights.snake1_alpha->name) + "/f32"),
-                              lookup_derived(std::string(weights.snake1_alpha->name) + "/f32/inv"));
+                              lookup_derived(std::string(weights.snake1_alpha->name) + "/f32/inv"),
+                              snake_ops_);
     h = ggml_map_custom3(ctx, h, weights.conv1_weight, weights.conv1_bias,
                          depthwise_conv_l2_custom, GGML_N_TASKS_MAX, op_ptr);
     h = snake_l2(ctx, h,
                  lookup_derived(std::string(weights.snake2_alpha->name) + "/f32"),
-                 lookup_derived(std::string(weights.snake2_alpha->name) + "/f32/inv"));
+                 lookup_derived(std::string(weights.snake2_alpha->name) + "/f32/inv"),
+                 snake_ops_);
     h = pointwise_l2(ctx, h, weights.conv2_weight,
                      lookup_derived(std::string(weights.conv2_bias->name) + "/f32"));
 
@@ -1179,7 +1329,8 @@ ggml_tensor* AudioVAE::sample_rate_condition_forward_l2(
     if (weights.out_weight != nullptr) {
         conditioned = snake_l2(ctx, conditioned,
                                lookup_derived(std::string(weights.out_snake_alpha->name) + "/f32"),
-                               lookup_derived(std::string(weights.out_snake_alpha->name) + "/f32/inv"));
+                               lookup_derived(std::string(weights.out_snake_alpha->name) + "/f32/inv"),
+                               snake_ops_);
         conditioned = pointwise_l2(ctx, conditioned, weights.out_weight,
                                    lookup_derived(std::string(weights.out_bias->name) + "/f32"));
     }
@@ -1194,7 +1345,8 @@ ggml_tensor* AudioVAE::decoder_block_forward_l2(ggml_context* ctx,
     x = sample_rate_condition_forward_l2(ctx, x, weights.sr_cond, sr_bucket);
     x = snake_l2(ctx, x,
                  lookup_derived(std::string(weights.snake_alpha->name) + "/f32"),
-                 lookup_derived(std::string(weights.snake_alpha->name) + "/f32/inv"));
+                 lookup_derived(std::string(weights.snake_alpha->name) + "/f32/inv"),
+                 snake_ops_);
 
     // convT：行重排派生 W_A/W_B + lowering（尾部 crop 内建）
     const std::string wn(weights.conv_weight->name);
@@ -1246,7 +1398,7 @@ ggml_tensor* AudioVAE::decode_tensor_l2(ggml_context* ctx, ggml_tensor* z,
 
     // final snake → 回 L1 → final conv k7（普通 conv，全 CPU 原路径）→ tanh
     x = snake_l2(ctx, x, lookup_derived("decoder.final.alpha/f32"),
-                 lookup_derived("decoder.final.alpha/f32/inv"));
+                 lookup_derived("decoder.final.alpha/f32/inv"), snake_ops_);
     x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));   // [T, C, 1]
     x = causal_conv1d(ctx, x, weights_.decoder_final_conv_weight,
                       weights_.decoder_final_conv_bias, 7, 1, 1, 3);
@@ -1405,7 +1557,8 @@ bool AudioVAEL2Plan::build(AudioVAE& vae, VoxCPMBackend& backend, int64_t t_len)
         const DecoderBlockWeights& blk = vae.weights().decoder_blocks[0];
         x = snake_l2(c, x,
                              vae.lookup_derived(std::string(blk.snake_alpha->name) + "/f32"),
-                             vae.lookup_derived(std::string(blk.snake_alpha->name) + "/f32/inv"));
+                             vae.lookup_derived(std::string(blk.snake_alpha->name) + "/f32/inv"),
+                             vae.snake_ops_);
 
         seg.output = x;
         seg.graph = seg.ctx.new_graph(512);
@@ -1473,7 +1626,8 @@ bool AudioVAEL2Plan::build(AudioVAE& vae, VoxCPMBackend& backend, int64_t t_len)
             res_chain(blk);
             x = snake_l2(c, x,
                          vae.lookup_derived(std::string(nb.snake_alpha->name) + "/f32"),
-                         vae.lookup_derived(std::string(nb.snake_alpha->name) + "/f32/inv"));
+                         vae.lookup_derived(std::string(nb.snake_alpha->name) + "/f32/inv"),
+                         vae.snake_ops_);
             seg.output = x;
             seg.graph = seg.ctx.new_graph(512);
             ggml_build_forward_expand(seg.graph, seg.output);
@@ -1508,7 +1662,7 @@ bool AudioVAEL2Plan::build(AudioVAE& vae, VoxCPMBackend& backend, int64_t t_len)
                 x = vae.residual_unit_forward_l2(c, x, *ress[ri], dilations[ri]);
             }
             x = snake_l2(c, x, vae.lookup_derived("decoder.final.alpha/f32"),
-                         vae.lookup_derived("decoder.final.alpha/f32/inv"));
+                         vae.lookup_derived("decoder.final.alpha/f32/inv"), vae.snake_ops_);
             x = ggml_cont(c, ggml_permute(c, x, 1, 0, 2, 3));   // 回 L1 [T, C]
             x = vae.causal_conv1d(c, x, vae.weights().decoder_final_conv_weight,
                                   vae.weights().decoder_final_conv_bias, 7, 1, 1, 3);

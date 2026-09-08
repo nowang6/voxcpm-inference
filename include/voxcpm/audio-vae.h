@@ -5,6 +5,7 @@
 #include "voxcpm/config.h"
 #include "voxcpm/context.h"
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -15,6 +16,17 @@ namespace voxcpm {
 class VoxCPMBackend;
 class VoxCPMWeightStore;
 struct AudioVAEDepthwiseConvOpData;
+
+// 融合 snake 自定义算子（ggml_map_custom1）的参数：alpha/inv 为 [C] F32
+// 派生权重。回调沿 L2 连续通道 Neon 4×F32 计算 y = x + inv·sin²(alpha·x)。
+struct AudioVAESnakeOpData {
+    const float* alpha = nullptr;
+    const float* inv = nullptr;
+};
+
+// 融合 snake 的 ggml custom1 回调（供 htp_smoke T14 数值对拍复用）
+void snake_fused_l2_custom(ggml_tensor* dst, const ggml_tensor* x,
+                           int ith, int nth, void* userdata);
 
 ggml_tensor* snake_activation(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha, float eps = 1e-9f);
 
@@ -232,7 +244,10 @@ private:
     ggml_tensor* last_decode_sr_cond_tensor_ = nullptr;
     int32_t last_decode_sr_bucket_ = 0;
     std::vector<float> last_preprocessed_audio_;
-    mutable std::vector<std::unique_ptr<AudioVAEDepthwiseConvOpData>> depthwise_ops_;
+    // deque（而非 vector）：push_back 不搬迁既有元素，注册进图的 op data
+    // 裸指针在后续 push 后保持有效（vector 扩容会使已注册指针悬垂）
+    mutable std::deque<std::unique_ptr<AudioVAEDepthwiseConvOpData>> depthwise_ops_;
+    mutable std::deque<std::unique_ptr<AudioVAESnakeOpData>> snake_ops_;
     std::shared_ptr<VoxCPMWeightStore> shared_store_;
 };
 
