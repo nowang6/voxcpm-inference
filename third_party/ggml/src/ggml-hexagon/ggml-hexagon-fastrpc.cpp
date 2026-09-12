@@ -115,6 +115,7 @@ enum qcom_chipset_soc_model {
     SM8650 = 57,  // v75, SD 8 Gen 3
     SM8750 = 69,  // v79, SD 8 Elite(aka 8 Gen 4)
     SM8850 = 73,  // v81, SD 8 Elite Gen 5(aka 8 Gen 5)
+    SM6650 = 641, // v73, SD 6 Gen 4 (Volcano)；编号为 /sys/devices/soc0/soc_id
 };
 
 struct qcom_socinfo {
@@ -250,6 +251,12 @@ struct ggml_backend_hexagon_context {
     bool has_hvx;                               // domain has HVX support
     bool has_async_fastrpc;                     // domain supports async FastRPC
     bool has_extended_map;                      // domain supports extended (>=4 GiB) VA mapping
+
+    // VTCM 实测容量（probe: vtcm_count × vtcm_page）。socinfo.vtcm_size_in_mb
+    // 是按 SoC 查表的硬编码值（v73 一律 8MB），与 SM6650 等裁剪平台的实测
+    // 容量（2MB）不符：AP 按查表值选的 kernel/unary 配置会被 DSP 拒收
+    // （AEE_EUNSUPPORTED 0x80000401）。probe 到实测值后覆写规划预算。
+    size_t vtcm_size_probed_mb = 0;             // 0 = 未 probe 到（沿用查表值）
 
     // Cached htp_mm_kernel_params per (weight_data, ne11). For TG, the
     // precompute math produces identical results for every token, so we
@@ -397,6 +404,17 @@ static struct qcom_socinfo g_hexagon_soc_info_table[] = {
                 .htp_arch          = V81,
                 .vtcm_size_in_mb   = 8,
                 .soc_desc          = "Qualcomm Snapdragon 8 Elite Gen5"},
+
+        /* Qualcomm Snapdragon 6 Gen 4（Volcano 平台）：v73 裁剪版，
+           2×HVX、无 HMX、VTCM 实测 2MB。arch 查表会误命中 SM8550，
+           必须经 soc_id probe 命中本项。
+           vtcm_size_in_mb 此处为初始规划预算，probe 实测值会覆写；
+           GGML_HEXAGON_VTCM_MB 环境变量可覆写做 A/B。 */
+        {
+                .soc_model         = SM6650,
+                .htp_arch          = V73,
+                .vtcm_size_in_mb   = 8,
+                .soc_desc          = "Qualcomm Snapdragon 6 Gen 4"},
 };
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
@@ -914,6 +932,8 @@ static const char * ggmlhexagon_get_socmodel_desc(uint32_t soc_model) {
             return "SM8750";
         case SM8850:
             return "SM8850";
+        case SM6650:
+            return "SM6650";
         default:
             return "unknown";
     }
@@ -1475,7 +1495,25 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
         || dsp_version == 0x75 || dsp_version == 0x79 || dsp_version == 0x81) {
         //0x68 -> 68, 0x69 -> 69, 0x73 -> 73, 0x75 -> 75, 0x79 -> 79, 0x81 -> 81
         htp_arch = ggmlhexagon_htparch_hex_to_decimal(dsp_version);
-        struct qcom_socinfo * socinfo = ggmlhexagon_get_socinfo_from_htparch(htp_arch);
+        // 优先按 soc_id（/sys/devices/soc0/soc_id）精确匹配：同 arch 的裁剪版
+        // SoC（如 SM6650 与 SM8550 同为 v73，但无 HMX、VTCM 2MB）只能靠 soc_id
+        // 区分；读不到 soc_id 时回退 arch 查表（保持原有行为）。
+        struct qcom_socinfo * socinfo = nullptr;
+#if defined(__ANDROID__) || defined(__linux__)
+        {
+            std::ifstream soc_id_file("/sys/devices/soc0/soc_id");
+            uint32_t soc_id = 0;
+            if (soc_id_file >> soc_id) {
+                socinfo = ggmlhexagon_get_socinfo_from_socmodel(soc_id);
+                if (socinfo) {
+                    GGMLHEXAGON_LOG_ALWAYS("soc_id %u -> %s", soc_id, socinfo->soc_desc);
+                }
+            }
+        }
+#endif
+        if (socinfo == nullptr) {
+            socinfo = ggmlhexagon_get_socinfo_from_htparch(htp_arch);
+        }
         GGML_ASSERT(nullptr != socinfo);
         ctx->socinfo = *socinfo;
         size_t total_mem = ggmlhexagon_get_system_total_memory_in_bytes();
@@ -1491,6 +1529,29 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
     ggmlhexagon_get_vtcm_info(ctx->domain_id, VTCM_COUNT, &vtcm_count);
     ggmlhexagon_get_vtcm_info(ctx->domain_id, VTCM_PAGE, &vtcm_page);
     ctx->has_vtcm = (vtcm_count > 0 && vtcm_page > 0);
+    // probe 实测 VTCM 容量直接作为 matmul/FA/unary 的 AP 侧规划预算：
+    // 查表值可能与实际不符（SM6650 实测 2MB，v73 查表误得 8MB，AP 按 8MB
+    // 选的 kernel 配置会被 DSP 拒收：AEE_EUNSUPPORTED 0x80000401）。
+    if (ctx->has_vtcm) {
+        const size_t probed_mb = ((size_t) vtcm_count * (size_t) vtcm_page) / SIZE_IN_MB;
+        if (probed_mb > 0 && probed_mb != ctx->socinfo.vtcm_size_in_mb) {
+            GGMLHEXAGON_LOG_ALWAYS("vtcm: probed %zu MB (count=%u page=%u), socinfo table %zu MB -> use probed",
+                                   probed_mb, vtcm_count, vtcm_page, ctx->socinfo.vtcm_size_in_mb);
+            ctx->vtcm_size_probed_mb = probed_mb;
+            ctx->socinfo.vtcm_size_in_mb = probed_mb;
+        }
+    }
+    // A/B 调试：允许环境变量覆写 matmul/FA 的 AP 侧 VTCM 规划预算（MB）。
+    {
+        const char * vtcm_env = getenv("GGML_HEXAGON_VTCM_MB");
+        if (vtcm_env && vtcm_env[0] != '\0') {
+            int v = atoi(vtcm_env);
+            if (v > 0 && v <= 64) {
+                ctx->socinfo.vtcm_size_in_mb = (size_t) v;
+                GGMLHEXAGON_LOG_ALWAYS("vtcm: GGML_HEXAGON_VTCM_MB override -> %d MB", v);
+            }
+        }
+    }
 
     uint32_t hvx_support_128b = 0;
     ggmlhexagon_get_hvx_support_info(ctx->domain_id, HVX_SUPPORT_128B, &hvx_support_128b);
@@ -2846,7 +2907,12 @@ static void ggml_hexagon_precompute_unary_params(
     kparams->src1_row_size_aligned = (uint32_t) src1_row_size_aligned;
     kparams->broadcast_weight      = broadcast_weight ? 1u : 0u;
 
-    const size_t vtcm_size_budget = ctx->socinfo.vtcm_size_in_mb * 1024ull * 1024ull;
+    // unary 布局 kparams 由 AP 算好直传 DSP，必须用实测 VTCM 容量（probe），
+    // 否则按查表 8MB 规划会在 2MB 实机报 HTP_STATUS_VTCM_TOO_SMALL / 被拒收；
+    // probe 不到时回退查表值。
+    const size_t vtcm_mb = ctx->vtcm_size_probed_mb > 0 ? ctx->vtcm_size_probed_mb
+                                                        : ctx->socinfo.vtcm_size_in_mb;
+    const size_t vtcm_size_budget = vtcm_mb * 1024ull * 1024ull;
 
     struct htp_unary_vtcm_layout L;
     uint32_t col_tile = 0;

@@ -1116,13 +1116,32 @@ static int build_mm_kernel_params(struct htp_ops_context * octx) {
                 : htp_mm_q8_0_flat_row_size(ne10));
             kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT;
 
+            // SM6650（VTCM 2MB）：FLAT 硬编码 n_prefetch=16 的 src0 预取缓冲可超预算。
+            // 与 tiled 路径一致按 2 的幂向下搜；kernel 通用支持 2..16。
             size_t vs0 = 0, vs1 = 0, vd = 0;
-            const size_t total_size = htp_mm_hvx_get_vtcm_sizes(
-                kparams->kernel_type, wtype, ne10, src1_nrows, octx->n_threads,
-                dst->nb[1], src0->nb[1], src1->nb[1], 16,
-                &vs0, &vs1, &vd);
+            size_t total_size = 0;
+            uint32_t best_n_prefetch = 16;
+            for (uint32_t d = 16; d >= 2; d /= 2) {
+                total_size = htp_mm_hvx_get_vtcm_sizes(
+                    kparams->kernel_type, wtype, ne10, src1_nrows, octx->n_threads,
+                    dst->nb[1], src0->nb[1], src1->nb[1], d,
+                    &vs0, &vs1, &vd);
+                if (total_size <= g_dsp_ctx->vtcm_size) {
+                    best_n_prefetch = d;
+                    break;
+                }
+            }
+            if (best_n_prefetch == 16 && total_size > g_dsp_ctx->vtcm_size) {
+                // 仍超预算：按 d=2 测量并保留（后续执行会因 VTCM 分配失败而报错，
+                // 但 kparams 需保持自洽以便 AP 侧日志定位）。
+                total_size = htp_mm_hvx_get_vtcm_sizes(
+                    kparams->kernel_type, wtype, ne10, src1_nrows, octx->n_threads,
+                    dst->nb[1], src0->nb[1], src1->nb[1], 2,
+                    &vs0, &vs1, &vd);
+                best_n_prefetch = 2;
+            }
 
-            kparams->n_prefetch     = 16;
+            kparams->n_prefetch     = (int32_t) best_n_prefetch;
             kparams->vtcm_size      = (int32_t) total_size;
             kparams->vtcm_src0_size = (int32_t) vs0;
             kparams->vtcm_src1_size = (int32_t) vs1;
