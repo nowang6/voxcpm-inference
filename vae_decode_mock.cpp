@@ -961,7 +961,7 @@ std::vector<float> decode_waveform(AudioVAE &audio_vae, VoxCPMBackend &backend,
   ggml_tensor *latent =
       graph_ctx.new_tensor_2d(GGML_TYPE_F32, total_patches, feat_dim);
   ggml_set_input(latent);
-  ggml_tensor *audio = audio_vae.decode(graph_ctx, latent);
+  ggml_tensor *audio = audio_vae.decode(graph_ctx, backend, latent);
   if (!audio) {
     fail("Failed to build AudioVAE decode graph");
   }

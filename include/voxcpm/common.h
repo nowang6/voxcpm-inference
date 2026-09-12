@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -47,11 +48,17 @@ constexpr int VOXCPM_VERSION_PATCH = 0;
         } \
     } while (0)
 
+#define VOXCPM_ABORT(msg) \
+    do { \
+        fprintf(stderr, "VOXCPM_ABORT: %s:%d: %s\n", __FILE__, __LINE__, msg); \
+        abort(); \
+    } while (0)
+
 // =============================================================================
 // fp16 权重组图辅助
 // =============================================================================
 
-// 权重按 GGUF 中的原生类型常驻(F16/Q8_0/F32,见 weight-store)。ggml 的二元算子
+// 权重按 GGUF 中的原生类型常驻(F16/Q8_0/Q4_K/F32,见 weight-store)。ggml 的二元算子
 // (add/mul 等)没有 F32(src0) + F16(src1) → F32 路径,把 F16 权重喂给这类算子前
 // 需要上转;mul_mat/conv_transpose_1d/get_rows 等算子原生支持 F16 权重,无需上转。
 // 已是 F32 的张量原样返回,不产生额外图节点。
@@ -109,6 +116,115 @@ inline size_t calc_context_size(int n_tensors, int max_nodes = 0) {
     size += 1024;  // Safety margin
     return size;
 }
+
+/**
+ * @brief Align size to GGML alignment
+ */
+inline size_t align_size(size_t size) {
+    const size_t alignment = 64;  // GGML_MEM_ALIGN
+    return ((size + alignment - 1) / alignment) * alignment;
+}
+
+// =============================================================================
+// Tensor Utilities
+// =============================================================================
+
+/**
+ * @brief Get element count of a tensor
+ */
+inline int64_t tensor_nelements(const ggml_tensor* tensor) {
+    if (!tensor) return 0;
+    return ggml_nelements(tensor);
+}
+
+/**
+ * @brief Get byte size of a tensor
+ */
+inline size_t tensor_nbytes(const ggml_tensor* tensor) {
+    if (!tensor) return 0;
+    return ggml_nbytes(tensor);
+}
+
+/**
+ * @brief Get tensor shape as string
+ */
+inline std::string tensor_shape_str(const ggml_tensor* tensor) {
+    if (!tensor) return "null";
+    char buf[256];
+    snprintf(buf, sizeof(buf), "[%ld, %ld, %ld, %ld]",
+             (long)tensor->ne[0], (long)tensor->ne[1],
+             (long)tensor->ne[2], (long)tensor->ne[3]);
+    return std::string(buf);
+}
+
+// =============================================================================
+// GGML Best Practice Helpers
+// =============================================================================
+
+/**
+ * @brief Mark tensor as input (required for scheduler)
+ */
+inline void mark_input(ggml_tensor* tensor) {
+    ggml_set_input(tensor);
+}
+
+/**
+ * @brief Mark tensor as output (required for allocator)
+ */
+inline void mark_output(ggml_tensor* tensor) {
+    ggml_set_output(tensor);
+}
+
+/**
+ * @brief Set tensor name and optionally mark as input
+ */
+inline void set_tensor_name(ggml_tensor* tensor, const char* name, bool is_input = false) {
+    ggml_set_name(tensor, name);
+    if (is_input) {
+        ggml_set_input(tensor);
+    }
+}
+
+// =============================================================================
+// Deleters for smart pointers
+// =============================================================================
+
+struct GGMLContextDeleter {
+    void operator()(ggml_context* ctx) const {
+        if (ctx) ggml_free(ctx);
+    }
+};
+
+struct GGMLBackendDeleter {
+    void operator()(ggml_backend_t backend) const {
+        if (backend) ggml_backend_free(backend);
+    }
+};
+
+struct GGMLBufferDeleter {
+    void operator()(ggml_backend_buffer_t buffer) const {
+        if (buffer) ggml_backend_buffer_free(buffer);
+    }
+};
+
+struct GGMLGallocrDeleter {
+    void operator()(ggml_gallocr_t gallocr) const {
+        if (gallocr) ggml_gallocr_free(gallocr);
+    }
+};
+
+struct GGUFContextDeleter {
+    void operator()(gguf_context* ctx) const {
+        if (ctx) gguf_free(ctx);
+    }
+};
+
+// Smart pointer aliases
+using UniqueContext = std::unique_ptr<ggml_context, GGMLContextDeleter>;
+using UniqueBackend = std::unique_ptr<ggml_backend, GGMLBackendDeleter>;
+using UniqueBuffer = std::unique_ptr<ggml_backend_buffer, GGMLBufferDeleter>;
+using UniqueGallocr = std::unique_ptr<ggml_gallocr, GGMLGallocrDeleter>;
+using UniqueGGUFContext = std::unique_ptr<gguf_context, GGUFContextDeleter>;
 
 }  // namespace voxcpm
 

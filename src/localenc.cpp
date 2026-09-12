@@ -1,0 +1,155 @@
+/**
+ * @file localenc.cpp
+ * @brief VoxCPM Local Encoder implementation
+ */
+
+#include "voxcpm/localenc.h"
+
+#include "voxcpm/backend.h"
+#include "voxcpm/weight-store.h"
+
+#include <cstdio>
+
+namespace voxcpm {
+
+LocEncModel::~LocEncModel() {
+    scratch_kv_cache_.reset();
+
+    if (weight_buffer_) {
+        ggml_backend_buffer_free(weight_buffer_);
+        weight_buffer_ = nullptr;
+    }
+    if (weight_ctx_) {
+        ggml_free(weight_ctx_);
+        weight_ctx_ = nullptr;
+    }
+}
+
+bool LocEncModel::init_scratch_cache(VoxCPMBackend& backend) {
+    if (scratch_kv_cache_) {
+        return true;
+    }
+
+    scratch_kv_cache_ = std::make_unique<MiniCPMKVCache>(
+        config().n_layer,
+        config().n_kv_heads,
+        config().max_length,
+        config().head_dim());
+    scratch_kv_cache_->init(backend);
+    return true;
+}
+
+bool LocEncModel::load_from_gguf(const std::string& gguf_path,
+                                 VoxCPMContext& weight_ctx,
+                                 VoxCPMContext& graph_ctx,
+                                 VoxCPMBackend& backend) {
+    VOXCPM_UNUSED(weight_ctx);
+    VOXCPM_UNUSED(graph_ctx);
+
+    auto store = std::make_shared<VoxCPMWeightStore>();
+    if (!store->load_from_file(gguf_path, backend)) {
+        return false;
+    }
+    return load_from_store(store, backend);
+}
+
+bool LocEncModel::load_from_store(const std::shared_ptr<VoxCPMWeightStore>& store,
+                                  VoxCPMBackend& backend) {
+    if (!store || !store->owns_storage()) {
+        return false;
+    }
+
+    shared_store_ = store;
+    weights_.in_proj_weight = store->get_tensor("locenc.in_proj.weight");
+    weights_.in_proj_bias = store->get_tensor("locenc.in_proj.bias");
+    weights_.special_token = store->get_tensor("locenc.special_token");
+    if (!weights_.in_proj_weight || !weights_.in_proj_bias || !weights_.special_token) {
+        return false;
+    }
+
+    feat_dim_ = static_cast<int>(weights_.in_proj_weight->ne[0]);
+
+    if (!encoder_.load_from_store(store, "locenc", backend)) {
+        return false;
+    }
+    if (config().hidden_size != static_cast<int>(weights_.special_token->ne[0])) {
+        return false;
+    }
+
+    backend_ = &backend;
+    return init_scratch_cache(backend);
+}
+
+ggml_tensor* LocEncModel::forward_patch(VoxCPMContext& ctx, ggml_tensor* input) {
+    VOXCPM_ASSERT(input != nullptr);
+    VOXCPM_ASSERT(backend_ != nullptr);
+    VOXCPM_ASSERT(scratch_kv_cache_ != nullptr);
+    VOXCPM_ASSERT(input->ne[1] > 0);
+
+    ggml_context* raw = ctx.raw_context();
+    const int64_t n_patches = input->ne[1];
+    const int hidden_size = config().hidden_size;
+
+    VOXCPM_ASSERT(n_patches + 1 <= config().max_length);
+    VOXCPM_ASSERT(input->ne[0] == feat_dim_ || input->ne[0] == hidden_size);
+
+    scratch_kv_cache_->clear();
+
+    ggml_tensor* projected = input;
+    if (input->ne[0] != hidden_size) {
+        projected = ggml_mul_mat(raw, weights_.in_proj_weight, input);
+        projected = ggml_add(raw, projected, weights_.in_proj_bias);
+    }
+
+    ggml_tensor* cls = ggml_reshape_2d(raw, weights_.special_token, hidden_size, 1);
+    ggml_tensor* full_input = ggml_concat(raw, cls, projected, 1);
+    ggml_tensor* output = encoder_.forward(ctx, full_input, nullptr, *scratch_kv_cache_, false, false);
+
+    return ggml_view_1d(raw, output, hidden_size, 0);
+}
+
+ggml_tensor* LocEncModel::forward_sequence(VoxCPMContext& ctx, ggml_tensor* input) {
+    VOXCPM_ASSERT(input != nullptr);
+    VOXCPM_ASSERT(backend_ != nullptr);
+    VOXCPM_ASSERT(scratch_kv_cache_ != nullptr);
+    VOXCPM_ASSERT(ggml_n_dims(input) == 3);
+    VOXCPM_ASSERT(input->ne[1] > 0);
+    VOXCPM_ASSERT(input->ne[2] > 0);
+
+    ggml_context* raw = ctx.raw_context();
+    const int64_t patch_size = input->ne[1];
+    const int64_t seq_len = input->ne[2];
+    const int hidden_size = config().hidden_size;
+
+    VOXCPM_ASSERT(patch_size + 1 <= config().max_length);
+    VOXCPM_ASSERT(input->ne[0] == feat_dim_ || input->ne[0] == hidden_size);
+
+    ggml_tensor* output = ggml_new_tensor_2d(raw, GGML_TYPE_F32, hidden_size, seq_len);
+    ggml_tensor* sync = nullptr;
+
+    for (int64_t idx = 0; idx < seq_len; ++idx) {
+        ggml_tensor* patch_view = ggml_view_2d(raw,
+                                               input,
+                                               input->ne[0],
+                                               patch_size,
+                                               input->nb[1],
+                                               static_cast<size_t>(idx) * input->nb[2]);
+        ggml_tensor* hidden = forward_patch(ctx, patch_view);
+        ggml_tensor* out_view = ggml_view_1d(raw,
+                                             output,
+                                             hidden_size,
+                                             static_cast<size_t>(idx) * output->nb[1]);
+        ggml_tensor* copied = ggml_cpy(raw, hidden, out_view);
+        ggml_tensor* copied_sum = ggml_sum(raw, copied);
+        sync = sync ? ggml_add(raw, sync, copied_sum) : copied_sum;
+    }
+
+    if (!sync) {
+        return output;
+    }
+
+    sync = ggml_scale(raw, sync, 0.0f);
+    return ggml_add1(raw, output, sync);
+}
+
+}  // namespace voxcpm

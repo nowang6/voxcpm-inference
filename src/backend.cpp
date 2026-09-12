@@ -1,11 +1,15 @@
 /**
  * @file backend.cpp
  * @brief VoxCPM Backend Implementation
+ *
+ * 纯 CPU 版本:自 VoxCPM.cpp 迁移时剥离了 CUDA/Vulkan/Metal 后端初始化与
+ * 多后端 scheduler,仅保留 CPU 后端 + gallocr 计算竞技场 + 缓冲区管理。
  */
 
 #include "voxcpm/backend.h"
 #include "ggml-cpu.h"
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +25,7 @@ namespace {
 struct BackendInitResult {
     ggml_backend_t backend = nullptr;
     BackendType type = BackendType::CPU;
+    bool is_gpu = false;
     std::string name;
     std::string description;
 };
@@ -59,16 +64,29 @@ BackendInitResult init_cpu_backend(int n_threads) {
 
     ggml_backend_cpu_set_n_threads(result.backend, n_threads);
     result.type = BackendType::CPU;
+    result.is_gpu = false;
     result.name = ggml_backend_name(result.backend);
     result.description = "CPU backend";
     return result;
 }
 
 BackendInitResult init_requested_backend(BackendType type, int n_threads) {
-    if (type != BackendType::CPU) {
-        throw Error(ErrorCode::BackendError, "Requested backend is not implemented in VoxCPM yet");
+    switch (type) {
+        case BackendType::CPU:
+            return init_cpu_backend(n_threads);
+
+        default:
+            throw Error(ErrorCode::BackendError, "Requested backend is not implemented in VoxCPM yet");
     }
-    return init_cpu_backend(n_threads);
+}
+
+void free_tracked_buffers(std::vector<ggml_backend_buffer_t>& buffers) {
+    for (auto& buf : buffers) {
+        if (buf) {
+            ggml_backend_buffer_free(buf);
+        }
+    }
+    buffers.clear();
 }
 
 }  // namespace
@@ -82,12 +100,15 @@ VoxCPMBackend::VoxCPMBackend(BackendType type, int n_threads)
     BackendInitResult result = init_requested_backend(type, n_threads);
     backend_ = result.backend;
     type_ = result.type;
+    is_gpu_ = result.is_gpu;
     allocator_logging_enabled_ = env_flag_enabled("VOXCPM_LOG_ALLOCATOR");
     backend_name_ = std::move(result.name);
     backend_description_ = std::move(result.description);
 }
 
 VoxCPMBackend::~VoxCPMBackend() {
+    free_tracked_buffers(buffers_);
+
     // Free allocator
     if (gallocr_) {
         ggml_gallocr_free(gallocr_);
@@ -104,16 +125,21 @@ VoxCPMBackend::VoxCPMBackend(VoxCPMBackend&& other) noexcept
       n_threads_(other.n_threads_),
       backend_(other.backend_),
       gallocr_(other.gallocr_),
+      is_gpu_(other.is_gpu_),
       allocator_logging_enabled_(other.allocator_logging_enabled_),
       backend_name_(std::move(other.backend_name_)),
-      backend_description_(std::move(other.backend_description_)) {
+      backend_description_(std::move(other.backend_description_)),
+      buffers_(std::move(other.buffers_)) {
     other.backend_ = nullptr;
     other.gallocr_ = nullptr;
+    other.is_gpu_ = false;
+    other.buffers_.clear();
 }
 
 VoxCPMBackend& VoxCPMBackend::operator=(VoxCPMBackend&& other) noexcept {
     if (this != &other) {
         // Free current resources
+        free_tracked_buffers(buffers_);
         if (gallocr_) ggml_gallocr_free(gallocr_);
         if (backend_) ggml_backend_free(backend_);
 
@@ -122,14 +148,52 @@ VoxCPMBackend& VoxCPMBackend::operator=(VoxCPMBackend&& other) noexcept {
         n_threads_ = other.n_threads_;
         backend_ = other.backend_;
         gallocr_ = other.gallocr_;
+        is_gpu_ = other.is_gpu_;
         allocator_logging_enabled_ = other.allocator_logging_enabled_;
         backend_name_ = std::move(other.backend_name_);
         backend_description_ = std::move(other.backend_description_);
+        buffers_ = std::move(other.buffers_);
 
         other.backend_ = nullptr;
         other.gallocr_ = nullptr;
+        other.is_gpu_ = false;
+        other.buffers_.clear();
     }
     return *this;
+}
+
+// =============================================================================
+// Buffer Management
+// =============================================================================
+
+ggml_backend_buffer_t VoxCPMBackend::alloc_buffer(ggml_context* ctx, BufferUsage usage) {
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+
+    if (!buffer) {
+        throw Error(ErrorCode::OutOfMemory, "Failed to allocate buffer");
+    }
+
+    // Set usage for weights
+    if (usage == BufferUsage::Weights) {
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+
+    // Track buffer
+    buffers_.push_back(buffer);
+
+    return buffer;
+}
+
+void VoxCPMBackend::free_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer) {
+        // Remove from tracking
+        auto it = std::find(buffers_.begin(), buffers_.end(), buffer);
+        if (it != buffers_.end()) {
+            buffers_.erase(it);
+        }
+        ggml_backend_buffer_free(buffer);
+    }
 }
 
 // =============================================================================
@@ -143,6 +207,13 @@ void VoxCPMBackend::init_allocator() {
     gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     if (!gallocr_) {
         throw Error(ErrorCode::OutOfMemory, "Failed to create graph allocator");
+    }
+}
+
+void VoxCPMBackend::reset_request_state() {
+    if (gallocr_) {
+        ggml_gallocr_free(gallocr_);
+        gallocr_ = nullptr;
     }
 }
 
@@ -217,15 +288,30 @@ void VoxCPMBackend::tensor_set(ggml_tensor* tensor, const void* data, size_t off
         throw Error(ErrorCode::BackendError, oss.str());
     }
 
+    const auto start = std::chrono::steady_clock::now();
     ggml_backend_tensor_set(tensor, data, offset, size);
+    const auto end = std::chrono::steady_clock::now();
+    transfer_stats_.host_to_device_bytes += size;
+    transfer_stats_.host_to_device_ms +=
+        std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 void VoxCPMBackend::tensor_get(const ggml_tensor* tensor, void* data, size_t offset, size_t size) {
+    const auto start = std::chrono::steady_clock::now();
     ggml_backend_tensor_get(tensor, data, offset, size);
+    const auto end = std::chrono::steady_clock::now();
+    transfer_stats_.device_to_host_bytes += size;
+    transfer_stats_.device_to_host_ms +=
+        std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 void VoxCPMBackend::tensor_copy(ggml_tensor* src, ggml_tensor* dst) {
+    const auto start = std::chrono::steady_clock::now();
     ggml_backend_tensor_copy(src, dst);
+    const auto end = std::chrono::steady_clock::now();
+    transfer_stats_.device_to_device_bytes += std::min(ggml_nbytes(src), ggml_nbytes(dst));
+    transfer_stats_.device_to_device_ms +=
+        std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 // =============================================================================
@@ -247,9 +333,5 @@ size_t VoxCPMBackend::compute_buffer_size() const {
     }
     return total;
 }
-
-// =============================================================================
-// Helper Functions
-// =============================================================================
 
 }  // namespace voxcpm
