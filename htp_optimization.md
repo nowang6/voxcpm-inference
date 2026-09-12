@@ -178,8 +178,8 @@ VOXCPM_BACKEND=cpu scripts/run_htp.sh voxcpm-vae-decode-mock ... # 同上
    逐块混合精度。
 2. **段间搬运 ~16 MB/步**：可进一步精简（如 convT 段直接输出拼接后布局，
    减少一次中间转置视角）。
-3. **Stage 3 调参矩阵未系统扫**：`GGML_HEXAGON_OPBATCH / MM_SELECT / NHVX /
-   NHMX`、CPU 线程绑核等。
+3. **Stage 3 调参矩阵未系统扫**：`GGML_HEXAGON_OPBATCH / MM_SELECT / NHVX`、
+   CPU 线程绑核等。
 4. **DSP SIN kernel**（vendored HTP 后端）缺失是 snake 无法全上 HTP 的根因；
    如后续允许改 DSP 侧，可消除每块 2 次跨段切分。
 5. **sched 跨设备拷贝失效**（CPU→HTP 方向，dspqueue 缓存语义）属 vendored

@@ -21,7 +21,6 @@ set(QHL_HVX_MATH_LIB "${HEXAGON_SDK_ROOT}/libs/qhl_hvx/prebuilt/hexagon_toolv19_
 set(HTP_OPS_SRCS
     work-queue.c
     dma-queue.c
-    hmx-queue.c
     matmul-ops.c
     flash-attn-ops.c
     gated-delta-net-ops.c

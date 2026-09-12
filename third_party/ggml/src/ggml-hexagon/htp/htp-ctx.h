@@ -2,7 +2,6 @@
 #define HTP_CTX_H
 
 #include "hex-dma.h"
-#include "hmx-queue.h"
 #include "htp-ops.h"
 #include "hex-profile.h"
 #include "work-queue.h"
@@ -77,7 +76,6 @@ struct htp_context {
     dma_queue_t            dma[HTP_MAX_NTHREADS];
     dma_queue_t            dma_cached[HTP_MAX_NTHREADS];
     work_queue_t           work_queue;
-    hmx_queue_t            hmx_queue;
 
     uint32_t               n_threads;
     struct fastdiv_values  n_threads_div;
@@ -85,7 +83,6 @@ struct htp_context {
     int                    thread_id;
     int                    thread_prio;
 
-    bool                   hmx_enabled;
     bool                   etm;
     uint32_t               profiler;
     struct htp_thread_trace trace[HTP_MAX_NTHREADS + 1];

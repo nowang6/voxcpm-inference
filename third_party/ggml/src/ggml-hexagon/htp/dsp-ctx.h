@@ -73,9 +73,6 @@ extern "C" {
 #endif
 
 // Forward declarations for types used in dsp_context.
-// Note: hmx_queue_t is `struct hmx_queue_s *` (typedef in hmx-queue.h), so the
-// forward declaration must use the _s suffix to match the new Qualcomm API.
-struct hmx_queue_s;
 struct htp_context;
 struct htp_tensor;
 
@@ -172,13 +169,6 @@ struct dsp_context {
     // Power
     int power_ctx;
     void * hexagon_power_ctx;
-
-    // HMX
-    int hmx_available;
-    struct hmx_queue_s * hmx_queue;
-    // Backing buffer for hmx_queue (NULL if hmx_queue is owned externally).
-    // Allocated via memalign in ggml_htp_setclocks and freed in ggml_htp_close.
-    void * hmx_queue_buf;
 
     // mempool
     void * mempool_dsp_base;

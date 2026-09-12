@@ -22,7 +22,6 @@
 
 #include "hex-utils.h"
 #include "hex-dma.h"
-#include "hmx-queue.h"
 
 #define GGML_COMMON_DECL_C
 #include "ggml-common.h"
@@ -35,8 +34,6 @@
 #include "hex-profile.h"
 #include "allreduce-ops.h"
 
-#define HMX_QUEUE_CAPACITY     16
-#define HMX_QUEUE_STACK_SIZE   16384
 #define WORK_QUEUE_CAPACITY    16
 #define WORK_QUEUE_STACK_SIZE  16384
 #define MAIN_THREAD_STACK_SIZE 32768
@@ -281,7 +278,6 @@ static int vtcm_alloc(struct htp_context * ctx) {
     HAP_compute_res_attr_set_cache_mode(&attr, 1);
     HAP_compute_res_attr_set_vtcm_param_v2(&attr, vtcm_size, vtcm_size, vtcm_size); // single page
     HAP_compute_res_attr_set_release_callback(&attr, vtcm_release_callback, (void *) ctx);
-    HAP_compute_res_attr_set_hmx_param(&attr, 1);
 
     // Allocate VTCM for scratch pads
     uint32_t rctx = HAP_compute_res_acquire(&attr, 1000000 /* timeout */);
@@ -318,7 +314,7 @@ static void htp_main_thread(void * context);
 static void htp_packet_callback(dspqueue_t queue, int error, void * context);
 static void htp_error_callback(dspqueue_t queue, int error, void * context);
 
-AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {
+AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint64_t max_vmem) {
     struct htp_handle * h = (struct htp_handle *) handle;
     if (!h) {
         return AEE_EBADPARM;
@@ -398,16 +394,6 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
     }
     offset = offset_dma + size_dma;
 
-    // 5. hmx_queue
-    size_t offset_hmx = 0;
-    size_t size_hmx = 0;
-    if (n_hmx) {
-        size_t hmx_align = hmx_queue_alignof();
-        offset_hmx = hex_align_up(offset, hmx_align);
-        size_hmx   = hmx_queue_sizeof(HMX_QUEUE_CAPACITY, HMX_QUEUE_STACK_SIZE);
-        offset = offset_hmx + size_hmx;
-    }
-
     size_t footprint = hex_align_up(offset, 128);
 
     void * block = memalign(4096, footprint);
@@ -484,52 +470,6 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
             return err;
         }
     }
-
-#if __HVX_ARCH__ >= 75
-    {
-        // Power on HMX and set HMX clock
-        HAP_power_request_t request;
-        memset(&request, 0, sizeof(HAP_power_request_t));
-        request.type = HAP_power_set_HMX_v2;
-        request.hmx_v2.set_power     = TRUE;
-        request.hmx_v2.power_up      = TRUE;
-        request.hmx_v2.set_clock     = TRUE;
-        request.hmx_v2.target_corner = HAP_DCVS_EXP_VCORNER_MAX;
-        request.hmx_v2.min_corner    = HAP_DCVS_EXP_VCORNER_MAX;
-        request.hmx_v2.max_corner    = HAP_DCVS_EXP_VCORNER_MAX;
-        request.hmx_v2.perf_mode     = HAP_CLK_PERF_HIGH;
-        FARF(ALWAYS, "Setting HMX clock\n");
-        err = HAP_power_set((void *) ctx, &request);
-        if (err != AEE_SUCCESS) {
-            FARF(ERROR, "ggml-hex: error setting HMX clock.");
-            htp_iface_stop(handle);
-            return err;
-        }
-    }
-#else
-    {
-        // Power on HMX
-        HAP_power_request_t request;
-        memset(&request, 0, sizeof(HAP_power_request_t));
-        request.type         = HAP_power_set_HMX;
-        request.hmx.power_up = TRUE;
-        FARF(ALWAYS, "Powering HMX on\n");
-        err = HAP_power_set((void *) ctx, &request);
-        if (err != AEE_SUCCESS) {
-            FARF(ERROR, "ggml-hex: error powering on HMX.");
-            htp_iface_stop(handle);
-            return err;
-        }
-    }
-#endif
-
-    ctx->hmx_enabled = n_hmx;
-    ctx->hmx_queue   = NULL;
-    if (n_hmx) {
-        void * hmx_ptr = (void *) ((uintptr_t) block + offset_hmx);
-        ctx->hmx_queue = hmx_queue_init(hmx_ptr, HMX_QUEUE_CAPACITY, HMX_QUEUE_STACK_SIZE, ctx->vtcm_rctx, &ctx->trace[HTP_MAX_NTHREADS]);
-    }
-    FARF(HIGH, "HMX %s (n_hmx=%d)", ctx->hmx_enabled ? "enabled" : "disabled", n_hmx);
 
     ctx->n_threads = n_hvx;
     ctx->n_threads_div = init_fastdiv_values(ctx->n_threads);
@@ -611,12 +551,6 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
         dma_queue_free(ctx->dma_cached[i]);
     }
 
-    if (ctx->hmx_queue) {
-        hmx_queue_free(ctx->hmx_queue);
-        ctx->hmx_queue = NULL;
-    }
-    ctx->hmx_enabled = false;
-
     vtcm_free(ctx);
 
     if (ctx->ddr_spad_base) {
@@ -631,9 +565,9 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
     return AEE_SUCCESS;
 }
 
-AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_t * n_hvx, uint32_t * n_hmx, uint64_t * vtcm_size) {
+AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_t * n_hvx, uint64_t * vtcm_size) {
     (void)handle;
-    if (!n_threads || !n_hvx || !n_hmx || !vtcm_size) {
+    if (!n_threads || !n_hvx || !vtcm_size) {
         return AEE_EBADPARM;
     }
 
@@ -652,7 +586,6 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     // for now we force n_threads == n_hvx
     *n_threads = n_hvx_val;
     *n_hvx     = n_hvx_val;
-    *n_hmx     = 1;
 
     uint32_t vtcm_sz = 8 * 1024 * 1024; // 8MB default fallback
     HAP_compute_res_query_VTCM(0, (unsigned int *)&vtcm_sz, NULL, NULL, NULL);
@@ -1099,9 +1032,6 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     octx->ctx       = ctx;
 
     work_queue_wakeup(ctx->work_queue);
-    if (ctx->hmx_queue) {
-        hmx_queue_wakeup(ctx->hmx_queue);
-    }
 
     int op_status = HTP_STATUS_OK;
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
@@ -1124,10 +1054,6 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         }
     }
 
-    if (ctx->hmx_queue) {
-        hmx_queue_suspend(ctx->hmx_queue);
-        hmx_queue_flush(ctx->hmx_queue);
-    }
     work_queue_suspend(ctx->work_queue);
 
     // Flush remaining dirty tensors at the end of the batch

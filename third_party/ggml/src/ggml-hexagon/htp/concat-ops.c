@@ -242,7 +242,7 @@ int op_concat(struct htp_ops_context * octx) {
         }
         uint32_t block_i = (type_size == 4) ? 32 : 64;
 
-        cctx.nrows_per_thread = hmx_ceil_div(dst->ne[1], n_threads);
+        cctx.nrows_per_thread = hex_ceil_div(dst->ne[1], n_threads);
 
         // Allocate VTCM
         uint32_t spad1_stride = block_i * type_size;

@@ -404,7 +404,7 @@ static void htp_argsort_f32_fallback(unsigned int n, unsigned int i, void * data
     uint32_t end_row = MIN(start_row + rows_per_thread, total_rows);
 
     size_t values_size = hex_round_up(ne00 * sizeof(float), 128);
-    uint32_t num_vec_ind_values = hmx_ceil_div(ne00, VLEN/(sizeof(int32_t)));
+    uint32_t num_vec_ind_values = hex_ceil_div(ne00, VLEN/(sizeof(int32_t)));
     float * values_buf = (float *) spad;
     int32_t * indices_buf = (int32_t *) (spad + values_size);
     HVX_Vector * indices_buf_vec = (HVX_Vector *) (spad + values_size);

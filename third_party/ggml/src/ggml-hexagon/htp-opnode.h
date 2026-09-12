@@ -320,9 +320,7 @@ struct htp_opformat {
             const auto * kparams = (const struct htp_mm_kernel_params *) node.kernel_params;
             const char * path = "unknown";
             int32_t type = kparams->kernel_type;
-            if (type == HTP_MM_KERNEL_HMX_2D || type == HTP_MM_KERNEL_HMX_F16_BATCHED) {
-                path = "hmx-tiled";
-            } else if (type == HTP_MM_KERNEL_HVX_F16_F16_VTCM || type == HTP_MM_KERNEL_HVX_F32_F32_VTCM ||
+            if (type == HTP_MM_KERNEL_HVX_F16_F16_VTCM || type == HTP_MM_KERNEL_HVX_F32_F32_VTCM ||
                        type == HTP_MM_KERNEL_HVX_QUANT_ROW    || type == HTP_MM_KERNEL_HVX_QUANT_BLOCK) {
                 path = "hvx-tiled";
             } else if (type == HTP_MM_KERNEL_HVX_F16_F16_DDR  || type == HTP_MM_KERNEL_HVX_F16_F32_DDR ||
@@ -335,9 +333,7 @@ struct htp_opformat {
             const auto * kparams = (const struct htp_fa_kernel_params *) node.kernel_params;
             const char * path = "unknown";
             int32_t type = kparams->kernel_type;
-            if (type == HTP_FA_KERNEL_HMX) {
-                path = kparams->u.hmx.pipeline ? "hmx-pipe" : "hmx-seq";
-            } else if (type == HTP_FA_KERNEL_HVX) {
+            if (type == HTP_FA_KERNEL_HVX) {
                 path = "hvx";
             }
             snprintf(str, max_size, "%s vtcm %d", path, (int) kparams->vtcm_size);

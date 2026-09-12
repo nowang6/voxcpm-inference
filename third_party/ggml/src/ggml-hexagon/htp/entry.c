@@ -17,7 +17,6 @@
 #include "ggml.h"
 
 #include "dsp-ctx.h"
-#include "hmx-queue.h"
 #include "htp-ctx.h"
 #include "matmul-ops.h"
 #include "flash-attn-ops.h"
@@ -32,13 +31,11 @@
 #define HEX_OP_PROF_DUMP_INTERVAL       25
 
 // Queue capacity/stack sizes: mirror htp/main.c
-#define HMX_QUEUE_CAPACITY              16
-#define HMX_QUEUE_STACK_SIZE            16384
 #define WORK_QUEUE_CAPACITY             16
 #define WORK_QUEUE_STACK_SIZE           16384
 
 // Max dst len for prior-dst skip (bit 1): single cacheline only.
-// Larger ranges risk stale L2 reads from async DMA/HMX paths.
+// Larger ranges risk stale L2 reads from async DMA paths.
 #define PRIOR_DST_MAX_LEN               DSP_CACHE_LINE_SIZE
 
 #define INVAL_SRC_IF_NEEDED(op_i, src_idx, dt_ptr, tensor_idx) do {                             \
@@ -366,7 +363,7 @@ static inline void weight_inval_unmark(const void * ptr) {
  *   tensor as a small dst of an earlier op in the same batch, and its range is
  *   fully contained, skip dcinva because the L2 line is fresh (DSP's own write).
  *   We require tensor_idx equality and len <= PRIOR_DST_MAX_LEN to avoid stale
- *   reads across DMA/HMX cache domains or aliased views. The per-op dst tracker
+ *   reads across DMA cache domains or aliased views. The per-op dst tracker
  *   populates the prior_dst list only when bit 2 is on, so bit 1 alone is a
  *   no-op (a cfg comment in ggml-hexagon.cfg covers this).
  * - bit 2 (bulk dst flush at batch end): collect all dst ranges during the
@@ -549,7 +546,7 @@ static int vtcm_release_callback(unsigned int rctx, void * state) {
 // =================================================================================================
 // IDL helper functions
 // =================================================================================================
-static int power_on_hvx_hmx(struct dsp_context * ctx) {
+static int power_on_hvx(struct dsp_context * ctx) {
     HAP_power_request_t req;
 
     /* Set client class */
@@ -599,34 +596,7 @@ static int power_on_hvx_hmx(struct dsp_context * ctx) {
         return -3;
     }
 
-    /* Power up HMX with v2 settings for v75+ architecture */
-#if __HVX_ARCH__ >= 75
-    memset(&req, 0, sizeof(req));
-    req.type = HAP_power_set_HMX_v2;
-    req.hmx_v2.set_power = 1;
-    req.hmx_v2.power_up = 1;
-    req.hmx_v2.set_clock = 1;
-    req.hmx_v2.target_corner = HAP_DCVS_EXP_VCORNER_MAX;
-    req.hmx_v2.min_corner = HAP_DCVS_EXP_VCORNER_MAX;
-    req.hmx_v2.max_corner = HAP_DCVS_EXP_VCORNER_MAX;
-    req.hmx_v2.perf_mode = HAP_CLK_PERF_HIGH;
-    GGMLHEXAGON_LOG_INFO("Setting HMX clock with HMX_v2 for v75+ architecture");
-    if (HAP_power_set((void *)&ctx->power_ctx, &req) != 0) {
-        GGMLHEXAGON_LOG_ERROR("HAP_power_set HMX_v2 failed, continuing without HMX");
-        return -4;
-    }
-#else
-    /* Power up HMX (legacy for older architectures) */
-    memset(&req, 0, sizeof(req));
-    req.type = HAP_power_set_HMX;
-    req.hmx.power_up = 1;
-    if (HAP_power_set((void *)&ctx->power_ctx, &req) != 0) {
-        GGMLHEXAGON_LOG_ERROR("HAP_power_set HMX failed, continuing without HMX");
-        return -4;
-    }
-#endif
-
-    GGMLHEXAGON_LOG_INFO("HAP_power_set for HVX and HMX succeeded");
+    GGMLHEXAGON_LOG_INFO("HAP_power_set for HVX succeeded");
     return 0;
 }
 
@@ -1009,120 +979,8 @@ static void build_htp_octx(
     octx->n_threads = (uint32_t)g_dsp_ctx->thread_counts;
 }
 
-// Try HMX precompute (simple 2D path). Mirrors ggml_hexagon_precompute_hmx_mm_params
-// minus the grouped batched path: this DSP-side fallback handles plain MUL_MAT
-// only; MUL_MAT_ID and fused matmuls rely on AP-precomputed kernel_params
-// (kernel_type != 0) and are never rebuilt here.
-// Returns true on success, false to fall back to HVX.
-static bool build_mm_hmx_params(struct htp_ops_context * octx,
-                                struct htp_mm_kernel_params * kparams) {
-    const struct htp_tensor * src0 = octx->src[0];
-    const struct htp_tensor * src1 = octx->src[1];
-
-    const int      wtype = src0->type;
-    const uint32_t ne00  = src0->ne[0];
-    const uint32_t ne01  = src0->ne[1];
-    const uint32_t ne02  = src0->ne[2];
-    const uint32_t ne03  = src0->ne[3];
-    const uint32_t ne10  = src1->ne[0];
-    const uint32_t ne11  = src1->ne[1];
-    const uint32_t ne12  = src1->ne[2];
-    const uint32_t ne13  = src1->ne[3];
-
-    const bool is_repack = (wtype == HTP_TYPE_Q4_0 || wtype == HTP_TYPE_Q4_1 ||
-                            wtype == HTP_TYPE_Q8_0 || wtype == HTP_TYPE_IQ4_NL ||
-                            wtype == HTP_TYPE_MXFP4);
-    const bool is_hmx_wtype = (wtype == HTP_TYPE_F16 || wtype == HTP_TYPE_F32 || is_repack);
-    if (!is_hmx_wtype) return false;
-
-    const bool is_batched = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
-
-    const int ne00_padded = is_repack ? hex_round_up(ne00, 32) : (int) ne00;
-    const int ne01_padded = is_repack ? hex_round_up(ne01, 32) : (int) ne01;
-    const int ne11_padded = hex_round_up(ne11, 32);
-
-    // Eligibility (mirrors ggml_hexagon_matmul_is_hmx_eligible)
-    if (ne01_padded % 32 != 0) return false;
-    if (ne00 % 32 != 0) return false;
-    if (is_batched && wtype != HTP_TYPE_F16) return false;
-    if (src0->nb[0] > src0->nb[1] || src1->nb[0] > src1->nb[1]) return false;
-    if (ne11 <= HTP_MM_HMX_MIN_NROWS) return false;
-
-    const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
-    const bool     pipeline          = htp_mm_hmx_pipeline(ne11);
-    const int      n_threads         = (int) octx->n_threads;
-    const size_t   vtcm_budget       = g_dsp_ctx->vtcm_size;
-
-    size_t best_mblocks       = SIZE_MAX;
-    int    best_act_threads   = 0;
-    size_t best_m_chunk       = 0;
-    size_t best_n_chunk       = 0;
-    size_t best_vtcm_size     = 0;
-
-    int act_threads = n_threads;
-    while (act_threads >= 1) {
-        const size_t act_f32_size = hex_align_up(
-            (size_t) act_threads * HTP_MM_DMA_ACT_MULTIPLIER * ne00_padded * sizeof(float),
-            HTP_MM_HMX_TILE_SIZE);
-        const size_t overhead = 256 + act_f32_size;
-
-        size_t cost_n = 0, cost_m = 0, cost_mn = 0;
-        htp_mm_hmx_get_2d_chunk_costs(wtype, ne00_padded, pipeline, aligned_tile_size,
-                                      &cost_n, &cost_m, &cost_mn);
-
-        size_t m_chunk_cand = 0, n_chunk_cand = 0, vtcm_size_cand = 0;
-        if (htp_mm_hmx_compute_chunks(vtcm_budget, overhead, cost_n, cost_m, cost_mn,
-                                      (size_t) ne11_padded, (size_t) ne01_padded,
-                                      (size_t) ne01_padded * HTP_MM_HMX_COST_W_DEQUANT,
-                                      (size_t) ne11 * HTP_MM_HMX_COST_A_CONVERT,
-                                      &m_chunk_cand, &n_chunk_cand, &vtcm_size_cand) == 0) {
-            size_t exact_size = htp_mm_hmx_get_2d_vtcm_size(
-                wtype, ne00_padded, m_chunk_cand, n_chunk_cand, pipeline,
-                act_threads, aligned_tile_size);
-            if (exact_size <= vtcm_budget) {
-                size_t mblocks = ((size_t) ne11 + m_chunk_cand - 1) / m_chunk_cand;
-                if (mblocks < best_mblocks ||
-                    (mblocks == best_mblocks && act_threads > best_act_threads)) {
-                    best_mblocks     = mblocks;
-                    best_act_threads = act_threads;
-                    best_m_chunk     = m_chunk_cand;
-                    best_n_chunk     = n_chunk_cand;
-                    best_vtcm_size   = exact_size;
-                }
-            }
-        }
-        if (act_threads == 1) break;
-        act_threads /= 2;
-    }
-
-    if (best_act_threads == 0) return false;
-
-    kparams->n_hmx             = 1;
-    kparams->pipeline           = pipeline ? 1 : 0;
-    kparams->m_chunk            = (int32_t) best_m_chunk;
-    kparams->n_chunk            = (int32_t) best_n_chunk;
-    kparams->n_threads          = n_threads;
-    kparams->n_act_threads      = best_act_threads;
-    kparams->tile_size          = (int32_t) htp_mm_get_weight_tile_size(wtype);
-    kparams->aligned_tile_size  = (int32_t) aligned_tile_size;
-    kparams->src1_row_size      = (int32_t)((wtype == HTP_TYPE_Q4_1)
-                                            ? htp_mm_q8_1_tiled_row_size(ne10)
-                                            : htp_mm_q8_0_tiled_row_size(ne10));
-    kparams->vtcm_size          = (int32_t) best_vtcm_size;
-    kparams->vtcm_src0_size     = 0;
-    kparams->vtcm_src1_size     = 0;
-    kparams->vtcm_dst_size      = 0;
-    kparams->n_prefetch         = 16;
-    kparams->kernel_type        = is_batched ? HTP_MM_KERNEL_HMX_F16_BATCHED
-                                             : HTP_MM_KERNEL_HMX_2D;
-    // Used by HMX kernels for activation DMA/work split (matmul-ops.c).
-    kparams->div_n_act_threads  = init_fastdiv_values((uint32_t) best_act_threads);
-    kparams->div_ne00_padded    = init_fastdiv_values((uint32_t) ne00_padded);
-    return true;
-}
-
 // Compute htp_mm_kernel_params on DSP side for MUL_MAT.
-// Tries HMX first (if available), falls back to HVX F32/F16/quantized paths.
+// Falls back to HVX F32/F16/quantized paths.
 static int build_mm_kernel_params(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
@@ -1133,10 +991,10 @@ static int build_mm_kernel_params(struct htp_ops_context * octx) {
         (struct htp_mm_kernel_params *) octx->kernel_params;
 
     // If AP side already precomputed kernel params (kernel_type != 0),
-    // skip DSP-side recomputation. The AP side uses the same HMX-first
-    // then HVX-fallback policy (ggml_hexagon_precompute_mm_params)
-    // as this function, and may have precomputed HMX chunk sizes that
-    // the DSP-side build_mm_hmx_params would otherwise recompute.
+    // skip DSP-side recomputation. The AP side uses the same HVX
+    // policy (ggml_hexagon_precompute_mm_params) as this function,
+    // and may have precomputed chunk sizes that would otherwise be
+    // recomputed here.
     if (kparams->kernel_type != 0) {
         return 0;
     }
@@ -1152,14 +1010,8 @@ static int build_mm_kernel_params(struct htp_ops_context * octx) {
     const uint32_t ne13 = src1->ne[3];
     const uint32_t src1_nrows = ne11 * ne12 * ne13;
 
-    kparams->n_hmx       = 0;
     kparams->n_threads   = octx->n_threads;
     kparams->n_prefetch  = 16;
-
-    // Try HMX first (mirrors ggml_hexagon_precompute_mm_params: HMX-first, HVX-fallback)
-    if (g_dsp_ctx->hmx_available && build_mm_hmx_params(octx, kparams)) {
-        goto mm_finalize;
-    }
 
     const bool is_batched  = (ne02 > 1) || (ne03 > 1);
     const bool is_permuted = (src0->nb[0] > src0->nb[1] || src0->nb[1] > src0->nb[2] || src0->nb[2] > src0->nb[3]) ||
@@ -1230,7 +1082,7 @@ static int build_mm_kernel_params(struct htp_ops_context * octx) {
                 ? HTP_MM_KERNEL_HVX_QUANT_BLOCK
                 : HTP_MM_KERNEL_HVX_QUANT_ROW;
 
-            const uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+            const uint32_t max_prefetch = (src1_nrows > HTP_MM_MIN_NROWS) ? 2 : 16;
             uint32_t best_n_prefetch = 2;
             size_t vs0 = 0, vs1 = 0, vd = 0;
             size_t total_size = 0;
@@ -1281,7 +1133,6 @@ static int build_mm_kernel_params(struct htp_ops_context * octx) {
         }
     }
 
-mm_finalize:
     kparams->div_ne12_ne1 = init_fastdiv_values(ne12 * ne11);
     kparams->div_ne1      = init_fastdiv_values(ne11);
     kparams->div_r2       = init_fastdiv_values(ne02 > 0 ? ne12 / ne02 : 1);
@@ -1388,13 +1239,10 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
     uint32_t hw_nhvx = (qurt_hvx_get_units() >> 8) & 0xFF;
     printf("hw_nhvx = %lu\n", hw_nhvx);
 
-    /* Step 1: Power up HVX and HMX */
-    int power_result = power_on_hvx_hmx(ctx);
+    /* Step 1: Power up HVX */
+    int power_result = power_on_hvx(ctx);
     if (power_result != 0) {
-        printf("power_on_hvx_hmx failed (%d), continuing without HMX\n", power_result);
-        ctx->hmx_available = 0;
-    } else {
-        ctx->hmx_available = 1;
+        printf("power_on_hvx failed (%d)\n", power_result);
     }
 
     /* Step 2: Query VTCM size and allocate resources */
@@ -1428,7 +1276,7 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
         printf("Compute resource query ctd, no page list data available\n");
     }
 
-    /* Step 3: Acquire compute resources (including VTCM and HMX) */
+    /* Step 3: Acquire compute resources (VTCM) */
     compute_res_attr_t attr;
     unsigned int vtcm_size_to_use = (DEFAULT_VTCM_SIZE < vtcm_size_query) ? DEFAULT_VTCM_SIZE : vtcm_size_query;
     HAP_compute_res_attr_init(&attr);
@@ -1436,7 +1284,6 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
     HAP_compute_res_attr_set_cache_mode(&attr, 1);  // Enable cache mode (matching official implementation)
     HAP_compute_res_attr_set_vtcm_param_v2(&attr, vtcm_size_to_use, vtcm_size_to_use, vtcm_size_to_use); // single page (matching official implementation)
     HAP_compute_res_attr_set_release_callback(&attr, vtcm_release_callback, NULL);  // Enable release callback for cache mode
-    HAP_compute_res_attr_set_hmx_param(&attr, 1);
     // Allocate VTCM for scratch pads
     ctx->compute_res_ctx_id = HAP_compute_res_acquire(&attr, 1000000);
     if (ctx->compute_res_ctx_id == 0) {
@@ -1472,47 +1319,6 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
             dsp_vtcm_acquire();
         }
     }
-
-    /* Step 4: Create async HMX queue for pipeline overlap (DMA/HVX/HMX).
-     * New Qualcomm API (b2dd28a3b) requires a pre-allocated backing buffer;
-     * we memalign it here and track it in dsp_context.hmx_queue_buf for
-     * cleanup in ggml_htp_close. Capacity/stack_size match main.c defaults. */
-    if (ctx->hmx_available && ctx->compute_res_ctx_id != 0) {
-        if (ctx->hmx_queue != NULL) {
-            GGMLHEXAGON_LOG_INFO("hmx_queue already exists, deleting old one\n");
-            hmx_queue_free(ctx->hmx_queue);
-            free(ctx->hmx_queue_buf);
-            ctx->hmx_queue     = NULL;
-            ctx->hmx_queue_buf = NULL;
-        }
-        size_t hmx_size  = hmx_queue_sizeof(HMX_QUEUE_CAPACITY, HMX_QUEUE_STACK_SIZE);
-        size_t hmx_align = hmx_queue_alignof();
-        void * hmx_buf   = memalign(hmx_align, hmx_size);
-        if (hmx_buf) {
-            // Trace slot mirrors htp/main.c (&ctx->trace[HTP_MAX_NTHREADS]): must be a
-            // valid (zeroed) htp_thread_trace, htp_trace_event_start/stop dereference
-            // it unconditionally on every HMX descriptor completion.
-            ctx->hmx_queue = hmx_queue_init(hmx_buf, HMX_QUEUE_CAPACITY,
-                                                  HMX_QUEUE_STACK_SIZE,
-                                                  ctx->compute_res_ctx_id,
-                                                  &ctx->htp_ctx->trace[HTP_MAX_NTHREADS]);
-            if (ctx->hmx_queue) {
-                ctx->hmx_queue_buf = hmx_buf;
-                GGMLHEXAGON_LOG_INFO("async HMX queue created (capacity %u, rctx %u)\n",
-                                     hmx_queue_capacity(ctx->hmx_queue), ctx->compute_res_ctx_id);
-            } else {
-                free(hmx_buf);
-                ctx->hmx_queue_buf = NULL;
-                GGMLHEXAGON_LOG_INFO("hmx_queue_init failed, HMX path will run synchronously\n");
-            }
-        } else {
-            GGMLHEXAGON_LOG_INFO("memalign for hmx_queue failed, HMX path will run synchronously\n");
-        }
-    } else {
-        GGMLHEXAGON_LOG_INFO("HMX not available (hmx=%d, rctx=%u), skipping hmx_queue creation\n",
-                             ctx->hmx_available, ctx->compute_res_ctx_id);
-    }
-
     /* Step 5: probe DSP memory for information only (no allocation) */
     {
         struct HAP_mem_stats mem_stats;
@@ -1594,16 +1400,6 @@ int ggml_htp_close(remote_handle64 handle) {
         ctx->htp_ctx = NULL;
     }
 
-    if (ctx->hmx_queue != NULL) {
-        hmx_queue_free(ctx->hmx_queue);
-        ctx->hmx_queue = NULL;
-        if (ctx->hmx_queue_buf) {
-            free(ctx->hmx_queue_buf);
-            ctx->hmx_queue_buf = NULL;
-        }
-        GGMLHEXAGON_LOG_INFO("released async HMX queue");
-    }
-
     /* VTCM: release once at session end (matches the pattern, see
      * ggml_htp_open). The release callback is still registered and will
      * set vtcm_needs_release=1 if another session preempts during the
@@ -1613,9 +1409,6 @@ int ggml_htp_close(remote_handle64 handle) {
 
     if (ctx->compute_res_ctx_id != 0) {
         // HAP_compute_res_release_cached is already called inside dsp_vtcm_release()
-        // NOTE: HMX lock is managed per-operation in mulmat.c, not here
-        // HAP_compute_res_hmx_unlock(ctx->compute_res_ctx_id);
-
         HAP_compute_res_release(ctx->compute_res_ctx_id);
         ctx->compute_res_ctx_id = 0;
         ctx->vtcm_base = NULL;
@@ -1631,8 +1424,8 @@ int ggml_htp_close(remote_handle64 handle) {
 AEEResult ggml_htp_setclocks(remote_handle64 handle, int32 diag_info, int32 requested_thread_counts, int32 * actual_thread_counts) {
     g_dsp_ctx = (struct dsp_context *)handle;
     if (!g_dsp_ctx) return AEE_EBADPARM;
-    /* Reserve 2 hw thread slots: one for the hmx_queue thread, one for
-     * FastRPC listener/system activity. An op needs requested_thread_counts+1
+    /* Reserve 2 hw thread slots: one for FastRPC listener/system activity,
+     * one as headroom. An op needs requested_thread_counts+1
      * co-resident threads; oversubscribing deadlocks because QuRT does
      * not preempt equal-priority workers spinning in hex_pause, so the
      * unscheduled worker never decrements the task barrier (observed on
@@ -1658,7 +1451,7 @@ AEEResult ggml_htp_setclocks(remote_handle64 handle, int32 diag_info, int32 requ
     printf("dump_diag_info:                 %d\n\n", g_dsp_ctx->dump_diag_info);
 
     // Initialize htp_context for calling the shared execute_op.
-    // Shares our already-acquired VTCM and HMX queue.
+    // Shares our already-acquired VTCM.
     // New Qualcomm API (b2dd28a3b) requires pre-allocated backing buffers for
     // work_queue and dma queues; we memalign them here and track the pointers
     // in dsp_context for cleanup in ggml_htp_close.
@@ -1695,10 +1488,8 @@ AEEResult ggml_htp_setclocks(remote_handle64 handle, int32 diag_info, int32 requ
         g_dsp_ctx->htp_ctx->vtcm_base      = (uint8_t *)g_dsp_ctx->vtcm_base;
         g_dsp_ctx->htp_ctx->vtcm_size      = g_dsp_ctx->vtcm_size;
         g_dsp_ctx->htp_ctx->vtcm_rctx      = g_dsp_ctx->compute_res_ctx_id;
-        g_dsp_ctx->htp_ctx->hmx_queue      = g_dsp_ctx->hmx_queue;
         g_dsp_ctx->htp_ctx->n_threads      = (uint32_t)g_dsp_ctx->thread_counts;
         g_dsp_ctx->htp_ctx->n_threads_div  = init_fastdiv_values((uint32_t)g_dsp_ctx->thread_counts);
-        g_dsp_ctx->htp_ctx->hmx_enabled    = g_dsp_ctx->hmx_available ? true : false;
 
         // work_queue: backing buffer holds worker stacks + queue struct.
         size_t wq_size  = work_queue_sizeof((uint32_t)g_dsp_ctx->thread_counts,
@@ -1840,27 +1631,19 @@ AEEResult ggml_htp_register_rpcmem(remote_handle64 h, uint32_t ion_fd, uint32_t 
     return AEE_SUCCESS;
 }
 
-// Wake/suspend the work_queue + hmx_queue worker threads around a batch,
+// Wake/suspend the work_queue worker threads around a batch,
 // mirroring htp/main.c htp_packet_callback. Without wakeup the workers stay in
 // qurt_futex_wait and (depending on QuRT futex semantics) can miss seqn
-// bumps; without hmx_queue_flush the batch can return while HMX descriptors
-// are still in flight, so AP reads back incomplete dst tensors.
+// bumps, so AP reads back incomplete dst tensors.
 static void dsp_queues_wakeup(void) {
     struct htp_context * htp = g_dsp_ctx->htp_ctx;
     if (htp->work_queue) {
         work_queue_wakeup(htp->work_queue);
     }
-    if (htp->hmx_queue) {
-        hmx_queue_wakeup(htp->hmx_queue);
-    }
 }
 
 static void dsp_queues_suspend(void) {
     struct htp_context * htp = g_dsp_ctx->htp_ctx;
-    if (htp->hmx_queue) {
-        hmx_queue_suspend(htp->hmx_queue);
-        hmx_queue_flush(htp->hmx_queue);
-    }
     if (htp->work_queue) {
         work_queue_suspend(htp->work_queue);
     }
@@ -2200,14 +1983,14 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
                 dp[16], dp[17], dp[18], dp[19],
                 src0_dt->nb[0], src0_dt->nb[1], src0_dt->nb[2], src0_dt->nb[3],
                 src0_dt->ne[0], src0_dt->ne[1], src0_dt->ne[2], src0_dt->ne[3]);
-            /* ktype, pipe, mch, nch, nthr, nact, nhmx, npf, src1rs, vtcm_sz,
+            /* ktype, pipe, mch, nch, nthr, nact, npf, src1rs, vtcm_sz,
              * vtcm_src0, vtcm_src1, vtcm_dst */
-            GGMLHEXAGON_LOG_ERROR("[DSP-MM-KP]  op%u ktype=%d pipe=%d mch=%d nch=%d nthr=%d nact=%d nhmx=%d npf=%d src1rs=%d vtcm_sz=%d src0_sz=%d src1_sz=%d dst_sz=%d",
+            GGMLHEXAGON_LOG_ERROR("[DSP-MM-KP]  op%u ktype=%d pipe=%d mch=%d nch=%d nthr=%d nact=%d npf=%d src1rs=%d vtcm_sz=%d src0_sz=%d src1_sz=%d dst_sz=%d",
                 i, octx.kernel_params[0], octx.kernel_params[1], octx.kernel_params[2],
                 octx.kernel_params[3], octx.kernel_params[4], octx.kernel_params[5],
-                octx.kernel_params[6], octx.kernel_params[7], octx.kernel_params[10],
+                octx.kernel_params[6], octx.kernel_params[9], octx.kernel_params[10],
                 octx.kernel_params[11], octx.kernel_params[12], octx.kernel_params[13],
-                octx.kernel_params[16]);
+                octx.kernel_params[15]);
         }
 #endif
 

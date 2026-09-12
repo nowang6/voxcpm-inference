@@ -1,6 +1,6 @@
 # SM6650 (volcano) HTP 异构解码基准
 
-设备：SM6650P，Hexagon v73（2 HVX + 1 HMX），Android 16，adb root。
+设备：SM6650P，Hexagon v73（2 HVX，无 HMX），Android 16，adb root。
 负载：`voxcpm-vae-decode-mock` 159 步全量（12.72s 音频，q4_0 GGUF，mempool 变体）。
 协议：`scripts/bench_sm6650.sh`（performance governor + 大核 taskset f0 + 45s 冷却 + 5 轮中位）。
 线程拓扑：cpu0-3 A55@1.8G / cpu4-6 A78@2.2G / cpu7 A78@2.3G；taskset f0 = cpu4-7。
@@ -24,7 +24,7 @@
 - **HTP vs CPU 输出一致性**：SNR 75.6dB、max|Δ|=3.07e-05（同 L2 图两后端，远超
   35dB 门槛）。
 - **真机纯 CPU 模式**（B 系列内核共享）：RTF 0.87 —— 与 HTP 0.85 几乎打平；
-  A78 dotprod Q8_0 GEMM ≈ SM6650 HTP（2 HVX+1 HMX），HTP 的现实价值是卸载
+  A78 dotprod Q8_0 GEMM ≈ SM6650 HTP（2 HVX），HTP 的现实价值是卸载
   CPU（流式生产中 CPU 可跑其它负载），而非净加速。
 - **smoke**：T2/T3/T4/T6/T8/T14 全绿；FAIL 项均为已知（T1 Q4_0 未落 HTP、
   T5/T7/T11 weights-buffer 输入、T10 direct、T9-F16 v73）。

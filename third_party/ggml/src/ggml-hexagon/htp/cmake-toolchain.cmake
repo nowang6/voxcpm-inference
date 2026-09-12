@@ -95,7 +95,7 @@ if (NOT NO_WRAP_MEM_API)
     set(WRAP_MEMALIGN -Wl,--wrap=memalign)
 endif()
 
-set(ARCH_FLAGS "-mcpu=${V_ARCH} -m${V_ARCH} -mhvx=${V_ARCH} -mhmx")
+set(ARCH_FLAGS "-mcpu=${V_ARCH} -m${V_ARCH} -mhvx=${V_ARCH}")
 
 set(PIC_SHARED_LD_FLAGS
     ${ARCH_FLAGS}
