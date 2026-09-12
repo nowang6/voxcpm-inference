@@ -1,8 +1,8 @@
 /**
  * @file config.h
- * @brief AudioVAE Configuration
+ * @brief VoxCPM Configuration Structures
  *
- * Configuration structure for the AudioVAE encoder/decoder.
+ * Configuration structures for all VoxCPM components.
  */
 
 #ifndef VOXCPM_CONFIG_H
@@ -130,6 +130,172 @@ struct AudioVAEConfig {
         }
         return channels;
     }
+};
+
+// =============================================================================
+// MiniCPM Configuration (for future use)
+// =============================================================================
+
+/**
+ * @brief MiniCPM Transformer Configuration
+ *
+ * Used by BaseLM (24 layers), ResidualLM (8 layers),
+ * LocEnc (8 layers), LocDiT (8 layers).
+ */
+struct MiniCPMConfig {
+    int hidden_size = 1024;
+    int intermediate_size = 4096;
+    int n_layer = 8;
+    int n_heads = 16;
+    int n_kv_heads = 2;          // GQA: 16 query heads, 2 KV heads
+    int kv_channels = 64;        // Per-head Q/K/V channel width
+    int vocab_size = 73448;
+    int max_length = 32768;
+
+    float rms_norm_eps = 1e-5f;
+    float rope_freq_base = 10000.0f;
+
+    // Scale factors (MiniCPM specific)
+    int scale_emb = 12;
+    int dim_model_base = 256;
+    float scale_depth = 1.4f;
+    bool use_mup = false;
+    bool no_rope = false;
+
+    // LongRoPE configuration
+    int rope_original_max = 32768;
+    std::vector<float> rope_long_factor;
+    std::vector<float> rope_short_factor;
+
+    int head_dim() const { return kv_channels > 0 ? kv_channels : hidden_size / n_heads; }
+};
+
+// =============================================================================
+// LocEnc Configuration (for future use)
+// =============================================================================
+
+/**
+ * @brief LocEnc (Local Encoder) Configuration
+ *
+ * Non-causal Transformer encoder for audio feature encoding.
+ * Processes patch features with special CLS token.
+ */
+struct LocEncConfig {
+    int hidden_size = 1024;
+    int n_layer = 4;
+    int n_heads = 16;
+    int n_kv_heads = 2;
+    int intermediate_size = 4096;
+    int patch_size = 2;
+    int feat_dim = 64;
+    float rms_norm_eps = 1e-5f;
+};
+
+// =============================================================================
+// LocDiT Configuration (for future use)
+// =============================================================================
+
+/**
+ * @brief LocDiT (Local Diffusion Transformer) Configuration
+ *
+ * DiT-based diffusion model for audio generation with CFM.
+ */
+struct LocDiTConfig {
+    int hidden_size = 1024;
+    int n_layer = 4;
+    int n_heads = 16;
+    int n_kv_heads = 2;
+    int intermediate_size = 4096;
+    int patch_size = 2;
+    int feat_dim = 64;
+    float rms_norm_eps = 1e-5f;
+
+    // CFM settings
+    float sigma_min = 1e-6f;
+    float cfg_rate = 2.0f;
+    int cfm_steps = 10;
+};
+
+// =============================================================================
+// FSQ Configuration (for future use)
+// =============================================================================
+
+/**
+ * @brief FSQ (Finite Scalar Quantization) Configuration
+ */
+struct FSQConfig {
+    int latent_dim = 256;
+    int scale = 9;               // Quantization levels: [-scale, scale]
+    int hidden_size = 1024;      // Input/output dimension
+};
+
+// =============================================================================
+// Projection Configuration
+// =============================================================================
+
+/**
+ * @brief Linear Projection Layer Configuration
+ *
+ * Used for:
+ * - enc_to_lm_proj: Projects LocEnc output to LM input
+ * - lm_to_dit_proj: Projects LM output to DiT input
+ * - res_to_dit_proj: Projects ResidualLM output to DiT input
+ */
+struct ProjectionConfig {
+    int in_dim = 1024;
+    int out_dim = 1024;
+};
+
+// =============================================================================
+// Stop Token Configuration
+// =============================================================================
+
+/**
+ * @brief Stop Token Prediction Configuration
+ *
+ * Predicts when generation should stop (binary classification).
+ * Architecture: Linear -> SiLU -> Linear (no bias on last layer)
+ */
+struct StopTokenConfig {
+    int hidden_dim = 1024;
+    int num_classes = 2;         // stop / continue
+};
+
+// =============================================================================
+// Embedding Configuration
+// =============================================================================
+
+/**
+ * @brief Token Embedding Configuration
+ *
+ * Token embedding lookup table.
+ * scale is applied when use_mup=true (MiniCPM specific).
+ */
+struct EmbeddingConfig {
+    int vocab_size = 73448;
+    int hidden_dim = 1024;
+    float scale = 1.0f;          // scale_emb (12 for MiniCPM)
+};
+
+// =============================================================================
+// VoxCPM Full Model Configuration
+// =============================================================================
+
+/**
+ * @brief Complete VoxCPM Model Configuration
+ */
+struct VoxCPMConfig {
+    AudioVAEConfig audio_vae;
+    MiniCPMConfig base_lm;
+    MiniCPMConfig residual_lm;
+    LocEncConfig loc_enc;
+    LocDiTConfig loc_dit;
+    FSQConfig fsq;
+
+    // Global settings
+    int patch_size = 2;
+    int feat_dim = 64;
+    int max_length = 4096;
 };
 
 }  // namespace voxcpm

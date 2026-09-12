@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.14)
 
 project(inference
     VERSION 0.1.0
-    DESCRIPTION "VoxCPM AudioVAE Inference with GGML (CPU only)"
+    DESCRIPTION "VoxCPM-0.5B TTS Inference with GGML (CPU only)"
     LANGUAGES CXX C
 )
 
@@ -86,13 +86,26 @@ if(TARGET ggml-hexagon AND GGML_HEXAGON_USE_MEMPOOL)
 endif()
 
 # =============================================================================
-# VoxCPM AudioVAE Library（仅 AudioVAE encoder/decoder + 基础设施）
+# VoxCPM Library（完整 TTS 引擎：AudioVAE + MiniCPM LM + LocEnc/LocDiT + CFM/FSQ
+# + tokenizer + runtime；自 VoxCPM.cpp 迁移，仅 CPU 路径）
 # =============================================================================
 
 add_library(voxcpm STATIC
+    third_party/miniaudio/miniaudio.c
     src/audio-vae.cpp
+    src/audio_io.cpp
     src/backend.cpp
+    src/components.cpp
     src/context.cpp
+    src/fsq.cpp
+    src/localenc.cpp
+    src/locdit.cpp
+    src/minicpm.cpp
+    src/output.cpp
+    src/state.cpp
+    src/tokenizer.cpp
+    src/unified_cfm.cpp
+    src/voxcpm.cpp
     src/weight-store.cpp
 )
 
@@ -102,6 +115,7 @@ target_include_directories(voxcpm
     PRIVATE
         ${GGML_DIR}/include
         ${GGML_DIR}/src
+        ${CMAKE_SOURCE_DIR}/third_party/miniaudio
 )
 
 target_link_libraries(voxcpm
@@ -114,6 +128,8 @@ target_link_libraries(voxcpm
 target_compile_definitions(voxcpm
     PRIVATE
         $<$<CONFIG:Debug>:VOXCPM_DEBUG>
+        VOXCPM_ENABLE_MP3=1
+        VOXCPM_ENABLE_OPUS=0
 )
 
 # Keep the historical output path ./build/examples/
@@ -132,3 +148,11 @@ target_link_libraries(voxcpm-vae-decode-mock PRIVATE voxcpm)
 
 add_executable(voxcpm-vae-dump-tensor-check dump_tensor_check.cpp)
 target_link_libraries(voxcpm-vae-dump-tensor-check PRIVATE voxcpm)
+
+# =============================================================================
+# voxcpm_tts: VoxCPM-0.5B 文本转语音 CLI（自 VoxCPM.cpp examples/voxcpm_tts.cpp
+# 迁移，--backend 仅接受 cpu）
+# =============================================================================
+
+add_executable(voxcpm_tts voxcpm_tts.cpp)
+target_link_libraries(voxcpm_tts PRIVATE voxcpm)
