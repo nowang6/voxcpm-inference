@@ -27,7 +27,13 @@ find_package(Threads REQUIRED)
 set(GGML_DIR ${CMAKE_SOURCE_DIR}/third_party/ggml)
 set(GGML_CUDA OFF CACHE BOOL "ggml: use CUDA" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "ggml: use Vulkan" FORCE)
-set(GGML_NATIVE ON CACHE BOOL "ggml: optimize the build for the current system" FORCE)
+# 交叉编译（Android/NDK）下 GGML_NATIVE 会探测 -mcpu=native，NDK clang 不支持，
+# 强制 OFF 走基线 armv8-a（CPU 侧仅承担 sin 等非 GEMM op，基线足够）
+if(CMAKE_CROSSCOMPILING)
+    set(GGML_NATIVE OFF CACHE BOOL "ggml: optimize the build for the current system" FORCE)
+else()
+    set(GGML_NATIVE ON CACHE BOOL "ggml: optimize the build for the current system" FORCE)
+endif()
 # vendored 子树已剪裁 examples/ tests/ 目录，显式关掉对应开关
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "ggml: build examples" FORCE)
 set(GGML_BUILD_TESTS    OFF CACHE BOOL "ggml: build tests"    FORCE)
