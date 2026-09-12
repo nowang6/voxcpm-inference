@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <inttypes.h>
 #include <math.h>
@@ -233,21 +234,9 @@ struct ggml_backend_hexagon_context {
     // Tracked in ctx so we can read rates after a sweep run without
     // changing existing per-call LOG_DEBUG output paths
     uint64_t n_mul_mat_total_cum = 0;           // total MUL_MAT ops in supported_nodes
-    uint64_t n_hmx_used_cum      = 0;           // MUL_MAT dispatched to HMX kernels
     uint64_t n_fused_qkv_cum     = 0;           // 3x MUL_MAT -> HTP_OP_MUL_MAT_NX (QKV) fusions
     uint64_t n_fused_ffn_cum     = 0;           // 2x MUL_MAT -> HTP_OP_MUL_MAT_NX (FFN) fusions
     uint64_t n_fused_mm_add_cum  = 0;           // MUL_MAT + ADD -> HTP_OP_MUL_MAT_ADD fusions
-
-    // HMX eligibility diagnostic counters (why MUL_MATs fall back to HVX)
-    uint64_t n_hmx_basic_pass          = 0;     // passed basic HMX eligibility
-    uint64_t n_hmx_basic_fail_ne01     = 0;     // ne01_padded %% 32 != 0
-    uint64_t n_hmx_basic_fail_ne00     = 0;     // ne00 %% 32 != 0
-    uint64_t n_hmx_basic_fail_wtype    = 0;     // weight type not HMX-compatible
-    uint64_t n_hmx_basic_fail_batched  = 0;     // batched non-F16
-    uint64_t n_hmx_basic_fail_permuted = 0;     // nb[0] > nb[1] (permuted)
-    uint64_t n_hmx_basic_fail_small_n  = 0;     // ne11 <= HTP_MM_HMX_MIN_NROWS
-    uint64_t n_hmx_vtcm_pass           = 0;     // HMX VTCM precompute succeeded
-    uint64_t n_hmx_vtcm_fail           = 0;     // HMX VTCM precompute failed
 
     // Buffer type owned by this context (each device has its own buft)
     struct ggml_backend_buffer_type buffer_type;
@@ -259,7 +248,6 @@ struct ggml_backend_hexagon_context {
     // Per-device hardware caps (probed at init, used by supports_op)
     bool has_vtcm;                              // domain has VTCM pages available
     bool has_hvx;                               // domain has HVX support
-    bool has_hmx;                               // domain has HMX support
     bool has_async_fastrpc;                     // domain supports async FastRPC
     bool has_extended_map;                      // domain supports extended (>=4 GiB) VA mapping
 
@@ -329,7 +317,7 @@ struct hexagon_appcfg_t {
     int ndev;                   // number of Hexagon devices (PDs), from GGML_HEXAGON_NDEV env
     int rpc_mmap_mode;          // 0=FASTRPC_MAP_FD_DELAYED (default), 1=FASTRPC_MAP_FD (eager pinning)
     int enable_opfusion;        // 1=enable QKV/FFN op fusion (default), 0=disable (for debugging)
-    int fa_select;              // flash attention: 2=HMX->HVX->CPU, 1=HVX->CPU, 0=CPU (default 2)
+    int fa_select;              // flash attention: 1=HVX->CPU, 0=CPU (default 1)
     int dsp_cache_mode;         // NPU-side entry.c cache optimization bitmask, pushed to NPU at init via
                                 //   execute_batch(0xFFFC) special mode. All four bits
                                 //   are wired into ggml_htp_execute_batch()
@@ -377,7 +365,7 @@ static struct hexagon_appcfg_t g_hexagon_appcfg = {
         .dsp_cache_trace_bit1   = 0,
         .enable_graph_optimize  = 1,
         .cfgfilename            = "ggml-hexagon.cfg",
-        .version                = {GGML_HEXAGON_VERSION},
+        .version                = GGML_HEXAGON_VERSION,
 };
 
 //TODO: add descriptors for more supported Snapdragon devices
@@ -1051,12 +1039,8 @@ static inline enum ggml_type ggml_hexagon_weight_dsp_type(enum ggml_type type) {
     return type;
 }
 
-static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
-    return type == GGML_TYPE_F16 || type == GGML_TYPE_F32 || ggml_hexagon_is_repack_type(type);
-}
-
 // Returns true if this buffer was allocated from the repack buffer type.
-// Repack buffers hold quantized weight data in tiled (HMX) layout and
+// Repack buffers hold quantized weight data in tiled layout and
 // require set_tensor/get_tensor to repack/unrepack across the boundary.
 static bool ggml_backend_buffer_is_hexagon_repack(const struct ggml_backend_buffer * b) {
     auto * ctx = (ggml_backend_hexagon_context *)b->buft->context;
@@ -1074,11 +1058,11 @@ static void ggmlhexagon_dump_perf_stats(const ggml_backend_hexagon_context * ctx
     size_t total_mem = ggmlhexagon_get_system_total_memory_in_bytes();
     GGMLHEXAGON_LOG_VERBOSE("device info: %s, dsp arch version v%zu, system mem size %zu MiB",
                              ctx->socinfo.soc_desc, ctx->socinfo.htp_arch, total_mem / SIZE_IN_MB);
-    GGMLHEXAGON_LOG_VERBOSE("device=%d name=%s arch=%s vtcm=%zuMB hvx=%d hmx=%d async_fastrpc=%d extended_map=%d",
+    GGMLHEXAGON_LOG_VERBOSE("device=%d name=%s arch=%s vtcm=%zuMB hvx=%d async_fastrpc=%d extended_map=%d",
                              ctx->device, ctx->name,
                              ggmlhexagon_get_htparch_desc(ctx->socinfo.htp_arch),
                              ctx->socinfo.vtcm_size_in_mb,
-                             (int)ctx->has_hvx, (int)ctx->has_hmx,
+                             (int)ctx->has_hvx,
                              (int)ctx->has_async_fastrpc, (int)ctx->has_extended_map);
     GGMLHEXAGON_LOG_VERBOSE("model: n_layer=%u (parsed from tensor name suffixes)",
                              ctx->max_layer_idx_seen + 1);
@@ -1126,53 +1110,20 @@ static void ggmlhexagon_dump_perf_stats(const ggml_backend_hexagon_context * ctx
 
     // MUL_MAT optimization diagnostics (PP). Cumulative across the run.
     // - n_mul_mat_total: every MUL_MAT in supported_nodes (cache miss only)
-    // - n_hmx_used:      MUL_MAT dispatched to HMX (kparams.n_hmx == 1)
     // - n_fused_qkv:     3x MUL_MAT (Q,K,V) merged into HTP_OP_MUL_MAT_NX
     // - n_fused_ffn:     2x MUL_MAT (gate,up) merged into HTP_OP_MUL_MAT_NX
     // - n_fused_mm_add:  MUL_MAT + ADD merged into HTP_OP_MUL_MAT_ADD
     {
         const double total = (double) ctx->n_mul_mat_total_cum;
-        const double hmx_pct  = total > 0 ? 100.0 * ctx->n_hmx_used_cum      / total : 0.0;
         const double qkv_pct  = total > 0 ? 100.0 * (3 * ctx->n_fused_qkv_cum) / total : 0.0;
         const double ffn_pct  = total > 0 ? 100.0 * (2 * ctx->n_fused_ffn_cum) / total : 0.0;
         const double add_pct  = total > 0 ? 100.0 * ctx->n_fused_mm_add_cum   / total : 0.0;
-        GGMLHEXAGON_LOG_VERBOSE("mul_mat coverage: total=%llu hmx=%llu (%.1f%%) qkv_fused=%llu (saves %.1f%%) "
+        GGMLHEXAGON_LOG_VERBOSE("mul_mat coverage: total=%llu qkv_fused=%llu (saves %.1f%%) "
                                "ffn_fused=%llu (saves %.1f%%) mm_add_fused=%llu (saves %.1f%%)",
                                (unsigned long long)ctx->n_mul_mat_total_cum,
-                               (unsigned long long)ctx->n_hmx_used_cum, hmx_pct,
                                (unsigned long long)ctx->n_fused_qkv_cum, qkv_pct,
                                (unsigned long long)ctx->n_fused_ffn_cum, ffn_pct,
                                (unsigned long long)ctx->n_fused_mm_add_cum, add_pct);
-    }
-
-    // HMX eligibility diagnostic: why MUL_MATs fall back to HVX
-    {
-        uint64_t basic_total = ctx->n_hmx_basic_pass
-                             + ctx->n_hmx_basic_fail_ne01
-                             + ctx->n_hmx_basic_fail_ne00
-                             + ctx->n_hmx_basic_fail_wtype
-                             + ctx->n_hmx_basic_fail_batched
-                             + ctx->n_hmx_basic_fail_permuted
-                             + ctx->n_hmx_basic_fail_small_n;
-        if (basic_total > 0) {
-            GGMLHEXAGON_LOG_VERBOSE("hmx eligibility: total=%llu pass=%llu (%.1f%%)",
-                                     (unsigned long long)basic_total,
-                                     (unsigned long long)ctx->n_hmx_basic_pass,
-                                     basic_total > 0 ? 100.0 * ctx->n_hmx_basic_pass / basic_total : 0.0);
-            GGMLHEXAGON_LOG_VERBOSE("hmx basic fail: ne01_align=%llu ne00_align=%llu wtype=%llu batched=%llu permuted=%llu small_n=%llu",
-                                     (unsigned long long)ctx->n_hmx_basic_fail_ne01,
-                                     (unsigned long long)ctx->n_hmx_basic_fail_ne00,
-                                     (unsigned long long)ctx->n_hmx_basic_fail_wtype,
-                                     (unsigned long long)ctx->n_hmx_basic_fail_batched,
-                                     (unsigned long long)ctx->n_hmx_basic_fail_permuted,
-                                     (unsigned long long)ctx->n_hmx_basic_fail_small_n);
-            GGMLHEXAGON_LOG_VERBOSE("hmx vtcm: pass=%llu fail=%llu (%.1f%% of basic-pass)",
-                                     (unsigned long long)ctx->n_hmx_vtcm_pass,
-                                     (unsigned long long)ctx->n_hmx_vtcm_fail,
-                                     ctx->n_hmx_basic_pass > 0
-                                        ? 100.0 * ctx->n_hmx_vtcm_fail / ctx->n_hmx_basic_pass
-                                        : 0.0);
-        }
     }
 }
 
@@ -1438,48 +1389,6 @@ bail:
     return;
 }
 
-static int ggmlhexagon_get_hmx_support_info(int domain, uint32_t attr, uint32_t * capability) {
-    int hexagon_error = AEE_SUCCESS;
-    *capability = 0;
-
-    if (attr != HMX_SUPPORT_SPATIAL && attr != HMX_SUPPORT_DEPTH) {
-        hexagon_error = AEE_EBADPARM;
-        GGMLHEXAGON_LOG_WARN("unsupported attr, only HMX_SUPPORT_SPATIAL and HMX_SUPPORT_DEPTH supported");
-        goto bail;
-    }
-
-    if (remote_handle_control) {
-        if (domain == CDSP_DOMAIN_ID) {
-            struct remote_dsp_capability dsp_capability_hmx_dsp;
-            dsp_capability_hmx_dsp.domain       = (uint32_t)domain;
-            dsp_capability_hmx_dsp.attribute_ID = attr;
-            dsp_capability_hmx_dsp.capability   = (uint32_t)0;
-            hexagon_error = remote_handle_control(DSPRPC_GET_DSP_INFO, &dsp_capability_hmx_dsp, sizeof(struct remote_dsp_capability));
-            if ((hexagon_error & 0xFF) == (AEE_EUNSUPPORTEDAPI & 0xFF)) {
-                GGMLHEXAGON_LOG_DEBUG("FastRPC Capability API is not supported on this device");
-                hexagon_error = AEE_SUCCESS;
-                goto bail;
-            }
-            else if (hexagon_error == AEE_SUCCESS) {
-                *capability = dsp_capability_hmx_dsp.capability;
-            } else {
-                GGMLHEXAGON_LOG_DEBUG("get_hmx_support_info failed with Error 0x%x", hexagon_error);
-                goto bail;
-            }
-        } else {
-            hexagon_error = AEE_EUNSUPPORTED;
-            GGMLHEXAGON_LOG_DEBUG("HMX support is not there for domain %d", domain);
-            goto bail;
-        }
-    } else {
-        hexagon_error = AEE_EUNSUPPORTEDAPI;
-        GGMLHEXAGON_LOG_DEBUG("remote_dsp_capability interface is not supported on this device");
-    }
-
-bail:
-    return hexagon_error;
-}
-
 static int ggmlhexagon_get_htp_arch_ver(int domain, uint32_t * capability) {
     int hexagon_error = AEE_SUCCESS;
     *capability = 0;
@@ -1583,28 +1492,15 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
     ggmlhexagon_get_vtcm_info(ctx->domain_id, VTCM_PAGE, &vtcm_page);
     ctx->has_vtcm = (vtcm_count > 0 && vtcm_page > 0);
 
-    uint32_t hmx_depth   = 0;
-    uint32_t hmx_spatial = 0;
-    //FIXME: better approach to get correct/accurate info
-    ggmlhexagon_get_hmx_support_info(ctx->domain_id, HMX_SUPPORT_DEPTH, &hmx_depth);
-    ggmlhexagon_get_hmx_support_info(ctx->domain_id, HMX_SUPPORT_SPATIAL, &hmx_spatial);
-
     uint32_t hvx_support_128b = 0;
     ggmlhexagon_get_hvx_support_info(ctx->domain_id, HVX_SUPPORT_128B, &hvx_support_128b);
     ctx->has_hvx = (hvx_support_128b > 0);
-    ctx->has_hmx = (hmx_depth > 0 || hmx_spatial > 0);
-    // Fallback: DSPRPC_GET_DSP_INFO may not report HMX on some devices
-    // HMX is present on V73+ (Snapdragon 8 Gen 2 and later); the NPU skel is built with -mhmx.
-    if (!ctx->has_hmx && htp_arch >= V73) {
-        ctx->has_hmx = true;
-    }
     GGMLHEXAGON_LOG_DEBUG("dsp arch version %d, vtcm_count %d, vtcm_page %d", htp_arch, vtcm_count, vtcm_page);
-    //FIXME: hmx_depth/hmx_spatial report 0 via DSPRPC_GET_DSP_INFO on some devices
     ctx->has_async_fastrpc  = ggmlhexagon_is_async_fastrpc_supported(ctx->domain_id);
     ctx->has_extended_map   = ggmlhexagon_is_extended_map_supported(ctx->domain_id);
-    GGMLHEXAGON_LOG_ALWAYS("device %d caps: has_vtcm=%d,has_hvx=%d,has_hmx=%d,hvx_support_128b %d,"
+    GGMLHEXAGON_LOG_ALWAYS("device %d caps: has_vtcm=%d,has_hvx=%d,hvx_support_128b %d,"
                             "unsigned pd supported %d, async fastrpc supported %d, extended va map supported %d",
-                                ctx->device, (int)ctx->has_vtcm, (int)ctx->has_hvx, (int)ctx->has_hmx, hvx_support_128b,
+                                ctx->device, (int)ctx->has_vtcm, (int)ctx->has_hvx, hvx_support_128b,
                                 ggmlhexagon_is_unsignedpd_supported(ctx->domain_id),
                                 (int)ctx->has_async_fastrpc,
                                 (int)ctx->has_extended_map);
@@ -2791,7 +2687,7 @@ static inline size_t htp_mm_hvx_id_get_vtcm_sizes(
     return vtcm_layout.total_bytes;
 }
 
-// FA kernel selection: 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+// FA kernel selection: 1 = HVX -> CPU, 0 = CPU (unsupported)
 // Controlled by ggml-hexagon.cfg: [cdsp] fa_select
 static int ggml_hexagon_get_fa_select(void) {
     return g_hexagon_appcfg.fa_select;
@@ -2799,7 +2695,7 @@ static int ggml_hexagon_get_fa_select(void) {
 
 // Precompute htp_fa_kernel_params on AP side for FLASH_ATTN_EXT.
 // Writes to kparams; caller casts from op.kernel_params or a stack local.
-// Returns true if a valid kernel (HMX or HVX) was selected.
+// Returns true if a valid kernel (HVX) was selected.
 static bool ggml_hexagon_compute_fa_params(
     const ggml_backend_hexagon_context * ctx,
     const ggml_tensor * node,
@@ -2849,51 +2745,7 @@ static bool ggml_hexagon_compute_fa_params(
     kparams->m0 = expf(-ln2 * max_bias / (float) n_head_log2);
     kparams->m1 = expf(-ln2 * (max_bias * 0.5f) / (float) n_head_log2);
 
-    // HMX eligibility
-    bool hmx_eligible = false;
-    if (ctx->has_hmx && ggml_hexagon_get_fa_select() >= 2 &&
-        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) {
-        if (DK % 64 == 0 && DV % 64 == 0 && !(DK <= 128 && neq1 < 5)) {
-            hmx_eligible = true;
-        }
-    }
-
-    if (hmx_eligible) {
-        size_t Br = 0, Bc = 0;
-        const size_t vtcm_budget = ctx->socinfo.vtcm_size_in_mb * 1024 * 1024;
-        int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK, DV, neq1, nek1,
-                                         vtcm_budget, (size_t) ctx->n_threads,
-                                         kparams->is_q_fp32 != 0);
-        if (ret == 0) {
-            kparams->kernel_type = HTP_FA_KERNEL_HMX;
-            kparams->Br          = (uint16_t) Br;
-            kparams->Bc          = (uint16_t) Bc;
-            kparams->n_kv_blocks = (uint16_t)((nek1 + Bc - 1) / Bc);
-            kparams->n_threads   = (kparams->n_kv_blocks >= 3 && ctx->n_threads >= 2)
-                                   ? (uint8_t) ctx->n_threads : 1;
-            kparams->u.hmx.g_br      = hex_align_up(G * Br, 32);
-            kparams->u.hmx.pipeline  = (kparams->n_kv_blocks >= 3 && ctx->n_threads >= 2) ? 1 : 0;
-            kparams->vtcm_size       = (uint32_t) hmx_fa_compute_vtcm_usage(
-                G, DK, DV, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0,
-                kparams->is_q_fp32 != 0);
-
-            const size_t row_vec_bytes = hex_align_up(Bc * sizeof(uint16_t), 256);
-            kparams->u.hmx.row_buf_stride = row_vec_bytes / 128;
-            const size_t m_line_bytes = hex_align_up(Bc * sizeof(uint16_t), 128);
-            kparams->u.hmx.mask_buf_row_stride = m_line_bytes / sizeof(uint16_t);
-            kparams->u.hmx.mask_broadcast = (mask && mask->ne[2] == 1) ? 1 : 0;
-            kparams->u.hmx.div_G = init_fastdiv_values(G);
-            if (mask) {
-                kparams->src3_div2 = init_fastdiv_values((uint32_t) mask->ne[2]);
-                kparams->src3_div3 = init_fastdiv_values((uint32_t) mask->ne[3]);
-            }
-            kparams->qrows = 0;
-            kparams->qrows_per_thread = 0;
-            return true;
-        }
-    }
-
-    // Fallback to HVX
+    // HVX kernel parameters
     kparams->kernel_type    = HTP_FA_KERNEL_HVX;
     kparams->Br             = 1;
     kparams->Bc             = 64;
@@ -3116,87 +2968,18 @@ static void ggml_hexagon_precompute_set_rows_params(
     kparams->vtcm_size = vtcm_layout.total_bytes;
 }
 
-static bool ggml_hexagon_matmul_is_hmx_eligible(
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const struct ggml_tensor * dst,
-    int ne01_padded,
-    bool is_matmul_id,
-    bool is_batched
-) {
-    const int ne00  = src0->ne[0];
-    const int ne11  = src1->ne[1];
-    const int ne12  = src1->ne[2];
-    // weights may be stored in a different format (see set_tensor)
-    const int wtype = ggml_hexagon_weight_dsp_type(src0->type);
-
-    if (ne01_padded % 32 != 0) {
-        return false;
-    }
-
-    if (!ggml_hexagon_is_hmx_weight_type((ggml_type) wtype)) {
-        return false;
-    }
-
-    if (ne00 % 32 != 0) {
-        return false;
-    }
-
-    if (!is_matmul_id && is_batched && wtype != GGML_TYPE_F16) {
-        return false;
-    }
-
-    if (src0->nb[0] > src0->nb[1] || src1->nb[0] > src1->nb[1]) {
-        return false;
-    }
-
-    const int m = is_matmul_id ? ne12 : ne11;
-    if (m <= HTP_MM_HMX_MIN_NROWS) {
-        return false;
-    }
-
-    return true;
-}
-
-// Shared HMX eligibility check: computes standard params from src0/src1/dst
-// and delegates to ggml_hexagon_matmul_is_hmx_eligible. Used by
-// mm_is_hmx_eligible (opfusion gate) to decide QKV/FFN merge eligibility.
-static bool ggml_hexagon_mm_is_hmx_eligible_shared(
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const struct ggml_tensor * dst
-) {
-    const int wtype = src0->type;
-    const bool is_repack    = ggml_hexagon_is_repack_type((ggml_type) wtype);
-    const bool is_matmul_id = (dst->op == GGML_OP_MUL_MAT_ID);
-    const bool is_batched   = (src0->ne[2] * src0->ne[3] > 1 || src1->ne[2] * src1->ne[3] > 1);
-    const int  ne01_padded  = is_repack ? (int) hex_round_up((uint32_t) src0->ne[1], 32) : src0->ne[1];
-
-    return ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);
-}
-
-// Gate for QKV/FFN fusion eligibility: returns true when the MUL_MAT
-// is suitable for HMX. Consulted only by is_mergeable_mul_mat to avoid
-// merging MUL_MATs that would benefit from HMX.
-// HMX dispatch itself is decided independently by ggml_hexagon_precompute_mm_params.
-static bool mm_is_hmx_eligible(const ggml_backend_hexagon_context * ctx, const ggml_tensor * t) {
-    if (!ctx->has_hmx) return false;
-    return ggml_hexagon_mm_is_hmx_eligible_shared(t->src[0], t->src[1], t);
-}
-
 // A MUL_MAT is fusion-eligible when:
 //   - src0 is quantized (Q4_0/Q8_0/etc.)
 //   - src1 is F32 (fusion kernels read F32 activations)
-//   - !mm_is_hmx_eligible (avoid merging MUL_MATs that would benefit from HMX)
 // NOTE: fusion is only attempted for MUL_MATs that match the QKV/FFN pattern.
-static bool is_mergeable_mul_mat(const ggml_backend_hexagon_context * ctx, const ggml_tensor * t) {
+static bool is_mergeable_mul_mat(const ggml_tensor * t) {
     if (!t || t->op != GGML_OP_MUL_MAT)   return false;
     if (t->src[1]->type != GGML_TYPE_F32) return false;
-    return ggml_is_quantized(t->src[0]->type) && !mm_is_hmx_eligible(ctx, t);
+    return ggml_is_quantized(t->src[0]->type);
 }
 
-static bool is_mergeable_mul_mat_pair(const ggml_backend_hexagon_context * ctx, const ggml_tensor * n1, const ggml_tensor * n2) {
-    if (!is_mergeable_mul_mat(ctx, n1) || !is_mergeable_mul_mat(ctx, n2)) {
+static bool is_mergeable_mul_mat_pair(const ggml_tensor * n1, const ggml_tensor * n2) {
+    if (!is_mergeable_mul_mat(n1) || !is_mergeable_mul_mat(n2)) {
         return false;
     }
     if (n1->src[1] != n2->src[1]) {
@@ -3213,7 +2996,7 @@ static bool is_mergeable_mul_mat_pair(const ggml_backend_hexagon_context * ctx, 
 }
 
 static bool is_qkv_mergeable(const ggml_backend_hexagon_context * ctx, const ggml_tensor * n_q, const ggml_tensor * n_k, const ggml_tensor * n_v) {
-    if (!is_mergeable_mul_mat(ctx, n_q) || !is_mergeable_mul_mat(ctx, n_k) || !is_mergeable_mul_mat(ctx, n_v)) {
+    if (!is_mergeable_mul_mat(n_q) || !is_mergeable_mul_mat(n_k) || !is_mergeable_mul_mat(n_v)) {
         return false;
     }
     if (n_q->src[1] != n_k->src[1] || n_q->src[1] != n_v->src[1]) {
@@ -3271,7 +3054,7 @@ static void ggml_hexagon_precompute_fused_qkv_params(
         size_t src1_sz_per_thread = hex_round_up((uint32_t)(src1_row_size * src1_nrows), 128);
         size_t src1_sz = src1_sz_per_thread;
 
-        const uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+        const uint32_t max_prefetch = (src1_nrows > HTP_MM_MIN_NROWS) ? 2 : 16;
         best_n_prefetch = 2;
         for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
             size_t repacked_vtcm_size = hex_round_up(d * tile_row_size, 128);
@@ -3366,7 +3149,7 @@ static void ggml_hexagon_precompute_fused_ffn_params(
         size_t src1_sz_per_thread = hex_round_up((uint32_t)(src1_row_size * src1_nrows), 128);
         size_t src1_sz = src1_sz_per_thread;
 
-        const uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+        const uint32_t max_prefetch = (src1_nrows > HTP_MM_MIN_NROWS) ? 2 : 16;
         best_n_prefetch = 2;
         for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
             size_t repacked_vtcm_size = hex_round_up(d * tile_row_size, 128);
@@ -3421,104 +3204,6 @@ static void ggml_hexagon_precompute_fused_ffn_params(
 }
 
 // Precompute htp_mm_kernel_params on AP side for MUL_MAT in FastRPC/mempool batch path.
-// Mirrors build_mm_kernel_params in htp/entry.c (F32/F16 HVX paths only).
-// Writes directly to op.kernel_params; NPU side consumes via memcpy.
-// For unsupported weight types (quant/HMX), leaves kernel_type=0 so NPU falls
-// back to build_mm_kernel_params which emits the error.
-// When is_matmul_id=false, the node is a plain MUL_MAT (not MUL_MAT_ID).
-// The HMX-first-then-HVX-fallback policy is preserved.
-static bool ggml_hexagon_precompute_hmx_mm_params(
-    const ggml_backend_hexagon_context * ctx,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const struct ggml_tensor * dst,
-    int wtype,
-    int ne00_padded,
-    int ne01_padded,
-    int ne02,
-    int ne11,
-    int ne12,
-    int ne11_padded,
-    bool is_matmul_id,
-    bool is_batched,
-    size_t vtcm_budget,
-    struct htp_mm_kernel_params * kparams
-) {
-    const int aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
-    // Force the pipelined path for plain MUL_MAT (MUL_MAT_ID keeps the
-    // non-pipelined setting, matching upstream): the synchronous (m<=32)
-    // branch yields corrupted, non-deterministic output in this integration
-    // (observed with ubatch<=32 for Qwen3.5-2B-Q4_0.gguf)
-    // Qualcomm uses the following logic to decide whether to enable HMX pipeline:
-    // const bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(ne11);
-    const bool pipeline = is_matmul_id ? false : true;
-    const int n_threads = (int) ctx->n_threads;
-    const int ne10      = src1->ne[0];
-
-    const bool is_batched_val   = is_matmul_id ? false : is_batched;
-    const int group_size        = (ne02 > 0 ? ne12 / ne02 : 1);
-
-    size_t m_chunk              = 0;
-    size_t n_chunk              = 0;
-    size_t vtcm_size            = 0;
-    bool use_grouped            = false;
-    int act_threads_selected    = 0;
-
-    GGMLHEXAGON_LOG_DEBUG("ne00 %d, ne01 %d, ne02 %d, ne10 %d, ne11 %d, ne12 %d", src0->ne[0], src0->ne[1], src0->ne[2], src1->ne[0], src1->ne[1], src1->ne[2]);
-
-    if (is_batched_val && wtype == GGML_TYPE_F16 && group_size > 1) {
-        // Try grouped path first
-        const bool use_dma_activation = (src1->nb[1]/sizeof(float) > (size_t)ne00_padded);
-        if (htp_mm_hmx_solve_batched_params(wtype, ne00_padded, ne01_padded, ne11,
-                    group_size, use_dma_activation, n_threads, pipeline,
-                    vtcm_budget, &m_chunk, &n_chunk,
-                    &act_threads_selected, &vtcm_size)) {
-            use_grouped = true;
-        }
-    }
-
-    if (!use_grouped) {
-        // Fallback to simple 2D path (group_size = 1)
-        const int m_id_rows = (int) ((size_t) dst->ne[1] * dst->ne[2]);
-        if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows,
-                    ne01_padded, ne11_padded, ne11, n_threads, pipeline,
-                    is_matmul_id, aligned_tile_size, vtcm_budget,
-                    &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
-            return false;
-        }
-    }
-
-    kparams->n_hmx              = 1;
-    kparams->pipeline           = pipeline ? 1 : 0;
-    kparams->m_chunk            = (int32_t) m_chunk;
-    kparams->n_chunk            = (int32_t) n_chunk;
-    kparams->n_threads          = n_threads;
-    kparams->n_act_threads      = act_threads_selected;
-    kparams->tile_size          = (int32_t) htp_mm_get_weight_tile_size(wtype);
-    kparams->aligned_tile_size  = (int32_t) aligned_tile_size;
-    kparams->src1_row_size      = (int32_t)((wtype == GGML_TYPE_Q4_1)
-                                        ? htp_mm_q8_1_tiled_row_size(ne10)
-                                        : htp_mm_q8_0_tiled_row_size(ne10));
-    kparams->vtcm_size          = (int32_t) vtcm_size;
-    kparams->vtcm_src0_size     = 0;
-    kparams->div_n_act_threads  = init_fastdiv_values((uint32_t) act_threads_selected);
-    kparams->div_ne00_padded    = init_fastdiv_values((uint32_t) ne00_padded);
-    kparams->vtcm_src1_size     = 0;
-    kparams->vtcm_dst_size      = 0;
-
-    if (is_batched && !is_matmul_id) {
-        kparams->kernel_type = HTP_MM_KERNEL_HMX_F16_BATCHED;
-    } else {
-        kparams->kernel_type = HTP_MM_KERNEL_HMX_2D;
-    }
-    GGMLHEXAGON_LOG_DEBUG("wtype=%d k=%lld n=%lld m=%lld pip=%d mc=%d nc=%d act=%d vtcm=%d nt=%d",
-            (int) wtype, (long long) src0->ne[0], (long long) src0->ne[1], (long long) ne11,
-            (int) pipeline, kparams->m_chunk, kparams->n_chunk, kparams->n_act_threads,
-            kparams->vtcm_size, ctx->n_threads);
-
-    return true;
-}
-
 static void ggml_hexagon_precompute_hvx_mm_params(
     const ggml_backend_hexagon_context * ctx,
     const struct ggml_tensor * src0,
@@ -3535,8 +3220,6 @@ static void ggml_hexagon_precompute_hvx_mm_params(
     size_t vtcm_budget,
     struct htp_mm_kernel_params * kparams
 ) {
-    kparams->n_hmx = 0;
-
     const bool is_quant     = (wtype != GGML_TYPE_F16 && wtype != GGML_TYPE_F32);
     const int src1_nrows    = ne11 * ne12 * ne13;
 
@@ -3555,7 +3238,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
                 : htp_mm_q8_0_tiled_row_size(ne10));
 
             size_t vtcm_src0_size = 0, vtcm_src1_size = 0, vtcm_dst_size = 0;
-            uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+            uint32_t max_prefetch = (src1_nrows > HTP_MM_MIN_NROWS) ? 2 : 16;
             uint32_t best_n_prefetch = 2;
             size_t total_size = 0;
             for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
@@ -3592,7 +3275,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
                     kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_ROW;
                 }
 
-                uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+                uint32_t max_prefetch = (src1_nrows > HTP_MM_MIN_NROWS) ? 2 : 16;
                 uint32_t best_n_prefetch = 2;
                 size_t vtcm_src0_size = 0, vtcm_src1_size = 0, vtcm_dst_size = 0;
                 size_t total_size = 0;
@@ -3782,54 +3465,11 @@ static void ggml_hexagon_precompute_mm_params(
         return;
     }
 
-    // HMX-first policy: try HMX precomputation if eligible, fall back to HVX.
-    bool hmx_enabled = ctx->has_hmx;
-    bool hmx_basic = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(
-            src0, src1, dst, ne01_padded, is_matmul_id, is_batched);
-
-    // HMX eligibility diagnostic: categorize why basic check failed
-    if (!hmx_enabled) {
-        // HMX not available on this SoC; nothing to count
-    } else if (hmx_basic) {
-        ctx->n_hmx_basic_pass++;
-    } else {
-        // Diagnose which condition failed (order matches ggml_hexagon_matmul_is_hmx_eligible)
-        if (ne01_padded % 32 != 0) {
-            ctx->n_hmx_basic_fail_ne01++;
-        } else if (!ggml_hexagon_is_hmx_weight_type((ggml_type) wtype)) {
-            ctx->n_hmx_basic_fail_wtype++;
-        } else if (ne00 % 32 != 0) {
-            ctx->n_hmx_basic_fail_ne00++;
-        } else if (!is_matmul_id && is_batched && wtype != GGML_TYPE_F16) {
-            ctx->n_hmx_basic_fail_batched++;
-        } else if (src0->nb[0] > src0->nb[1] || src1->nb[0] > src1->nb[1]) {
-            ctx->n_hmx_basic_fail_permuted++;
-        } else {
-            int m = is_matmul_id ? (int)ne12 : (int)ne11;
-            if (m <= HTP_MM_HMX_MIN_NROWS) {
-                ctx->n_hmx_basic_fail_small_n++;
-            }
-        }
-    }
-
-    if (hmx_basic) {
-        if (ggml_hexagon_precompute_hmx_mm_params(
-                ctx, src0, src1, dst, wtype, ne00_padded, ne01_padded,
-                ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched,
-                vtcm_budget, kparams)) {
-            ctx->n_hmx_vtcm_pass++;
-            goto finalize;
-        }
-        ctx->n_hmx_vtcm_fail++;
-    }
-
-    // Fallback to HVX parameter computation
     ggml_hexagon_precompute_hvx_mm_params(
         ctx, src0, src1, dst, wtype,
         ne02, ne03, ne10, ne11, ne12, ne13,
         is_matmul_id, vtcm_budget, kparams);
 
-finalize:
     kparams->div_ne12_ne1 = init_fastdiv_values((uint32_t)(ne12 * ne11));
     kparams->div_ne1      = init_fastdiv_values((uint32_t) ne11);
     kparams->div_r2       = init_fastdiv_values(ne02 > 0 ? (uint32_t)(ne12 / ne02) : 1);
@@ -4547,7 +4187,7 @@ struct ggml_backend_hexagon_buffer_context {
     struct ggml_backend_hexagon_context * backend_ctx = nullptr;
 };
 
-// Repack quantized types into tiled (HMX) layout only when the tensor
+// Repack quantized types into tiled layout only when the tensor
 // lives in the repack buffer (e.g. weights loaded from GGUF). Tensors
 // in the main buffer (e.g. test-backend-ops allocations) stay in canonical GGML format.
 static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
@@ -5149,24 +4789,13 @@ ggml_backend_hexagon_context::ggml_backend_hexagon_context(int dev_id, ggml_back
       rpc_overhead_sum_us(0),
       rpc_overhead_count(0),
       n_mul_mat_total_cum(0),
-      n_hmx_used_cum(0),
       n_fused_qkv_cum(0),
       n_fused_ffn_cum(0),
       n_fused_mm_add_cum(0),
-      n_hmx_basic_pass(0),
-      n_hmx_basic_fail_ne01(0),
-      n_hmx_basic_fail_ne00(0),
-      n_hmx_basic_fail_wtype(0),
-      n_hmx_basic_fail_batched(0),
-      n_hmx_basic_fail_permuted(0),
-      n_hmx_basic_fail_small_n(0),
-      n_hmx_vtcm_pass(0),
-      n_hmx_vtcm_fail(0),
       buffer_type{},
       repack_buffer_type{},
       has_vtcm(false),
       has_hvx(false),
-      has_hmx(false),
       has_async_fastrpc(false),
       has_extended_map(false),
       warned_qkv_name(false),
@@ -5395,9 +5024,6 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
             if (node->op == GGML_OP_MUL_MAT) {
                 ggml_hexagon_precompute_mm_params(ctx, node, op, false);
                 ctx->n_mul_mat_total_cum++;
-                if (((const struct htp_mm_kernel_params *) op.kernel_params)->n_hmx) {
-                    ctx->n_hmx_used_cum++;
-                }
             } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
                 ggml_hexagon_compute_fa_params(ctx, node,
                     (struct htp_fa_kernel_params *) op.kernel_params);
@@ -5486,9 +5112,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     //   2x MUL_MAT (gate,up)-> HTP_OP_MUL_MAT_NX      (via NPU execute_op)
     //
     // QKV/FFN fusion eligibility:
-    //   quantized src0 + F32 src1 + !mm_is_hmx_eligible.
-    //   HMX-eligible MUL_MATs are excluded: fusion redirects to HVX fused
-    //   kernels, while HMX-eligible ops benefit more from the HMX pipeline.
+    //   quantized src0 + F32 src1.
     if (!cache_hit) {
         // Count src usages of each tensor; fusable intermediates must have exactly one consumer
         std::vector<int> src_use_count(n_tensors, 0);
@@ -5513,9 +5137,9 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         const size_t vtcm_budget = ctx->socinfo.vtcm_size_in_mb * 1024 * 1024;
         // QKV/FFN fusion prerequisites:
         //   - dispatches via NPU execute_op, which provides
-        //     op_matmul_nx as dedicated fused kernel (htp/matmul-ops.c).
-        // htp_arch>=V73 is required because op_matmul_nx uses HMX instructions.
-        bool qkv_ffn_enabled = (ctx->socinfo.htp_arch >= V73 && g_hexagon_appcfg.enable_opfusion);
+        //     op_matmul_nx as dedicated fused kernel (htp/matmul-ops.c),
+        //     implemented with the HVX quant fused kernels.
+        bool qkv_ffn_enabled = g_hexagon_appcfg.enable_opfusion;
         for (size_t i = 0; i < hex_ops.size(); i++) {
             hex_op_desc op = hex_ops[i];
 
@@ -5637,13 +5261,13 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 // NX layout: src[0]=Wgate, src[1]=Wup, src[2]=y(activation);
                 //            dst[0]=gate, dst[1]=up.
                 // Only triggers when is_mergeable_mul_mat returns true
-                // (quantized src0 + F32 src1 + !mm_is_hmx_eligible).
+                // (quantized src0 + F32 src1).
                 if (i + 1 < hex_ops.size()) {
                     const hex_op_desc & next = hex_ops[i + 1];
                     if (next.opcode == GGML_OP_MUL_MAT) {
                         const ggml_tensor * n_gate = tensor_src[op.dst_idx[0]];
                         const ggml_tensor * n_up   = tensor_src[next.dst_idx[0]];
-                        if (is_mergeable_mul_mat_pair(ctx, n_gate, n_up)) {
+                        if (is_mergeable_mul_mat_pair(n_gate, n_up)) {
                             struct htp_mm_kernel_params kparams;
                             ggml_hexagon_precompute_fused_ffn_params(ctx, n_gate->src[0], n_gate->src[1], &kparams);
                             kparams.n_weights = 2;
@@ -5961,7 +5585,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     //   offsets for NPU descriptor updates in Phase 8.
     {
         // Quantized weights (Q4_0 / Q4_1 / Q8_0 / IQ4_NL / MXFP4 / Q4_K / Q5_K / Q6_K)
-        // are repacked to tile-based (HMX) layout in set_tensor during model loading.
+        // are repacked to tile-based layout in set_tensor during model loading.
         // By the time graph_compute_batch runs, every quantized weight's
         // data at t->data is already in tiled layout, so Phase 6 does
         // NO repack work here.

@@ -25,7 +25,7 @@ static inline uint32_t hex_ceil_pow2(uint32_t x) {
     return p;
 }
 
-static inline size_t hmx_ceil_div(size_t num, size_t den) {
+static inline size_t hex_ceil_div(size_t num, size_t den) {
     return (num + den - 1) / den;
 }
 
@@ -34,7 +34,7 @@ static inline int32_t hex_is_aligned(const void * addr, uint32_t align) {
 }
 
 static inline size_t hex_align_up(size_t v, size_t align) {
-    return hmx_ceil_div(v, align) * align;
+    return hex_ceil_div(v, align) * align;
 }
 
 static inline size_t hex_align_down(size_t v, size_t align) {

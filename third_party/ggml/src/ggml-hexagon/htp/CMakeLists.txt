@@ -17,7 +17,6 @@ include_directories(
 set(HTP_OPS_SRCS
     work-queue.c
     dma-queue.c
-    hmx-queue.c
     matmul-ops.c
     flash-attn-ops.c
     gated-delta-net-ops.c
